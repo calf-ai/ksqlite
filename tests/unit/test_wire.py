@@ -17,12 +17,11 @@ def test_wf01_encode() -> None:
     assert isinstance(record.value, bytes)
     assert json.loads(record.value.decode("utf-8")) == {"a": 1}
     # Header keys are str, values bytes (aiokafka carries only bytes; the
-    # fakes and CF-05 pin the same shape). Snapshotted to a tuple: frozen
-    # means frozen.
-    assert record.headers == (
+    # fakes and CF-05 pin the same shape). A list, as the producer requires.
+    assert record.headers == [
         ("format_version", b"1"),
         ("message_id", MID.encode("utf-8")),
-    )
+    ]
 
     unicode_record = _wire.encode(entity_key="tâsk-🚀", payload={}, message_id=MID)
     assert unicode_record.key == "tâsk-🚀".encode()

@@ -7,7 +7,6 @@ with the real client via the conformance suite.
 """
 
 import asyncio
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -443,8 +442,12 @@ class FakeProducer:
         value: bytes | None = None,
         key: bytes | None = None,
         partition: int | None = None,
-        headers: Sequence[tuple[str, bytes]] | None = None,
+        headers: list[tuple[str, bytes]] | None = None,
     ) -> RecordMetadata:
+        if headers is not None and not isinstance(headers, list):
+            # Faithful to aiokafka's (Cython) record-batch builder, which
+            # rejects a non-list here with exactly this message.
+            raise TypeError(f"Expected list, got {type(headers).__name__}")
         if self._delay_gate is not None:
             gate, self._delay_gate = self._delay_gate, None
             await gate.pass_through()

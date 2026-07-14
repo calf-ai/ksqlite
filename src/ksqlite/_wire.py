@@ -98,16 +98,16 @@ def classify(
 class EncodedRecord:
     """What ``append`` produces to the changelog (spec §10 wire format).
 
-    ``headers`` is snapshotted to a tuple at construction (same frozen-means-
-    frozen rule as ``types.Index.columns``).
+    ``headers`` MUST be a ``list``: aiokafka's producer requires a list (its
+    Cython record-batch builder rejects a tuple with "Expected list, got
+    tuple"), and this object is created and consumed within a single
+    ``append`` and never re-exposed, so there is nothing to protect against
+    external mutation.
     """
 
     key: bytes
     value: bytes
-    headers: Sequence[tuple[str, bytes]]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "headers", tuple(self.headers))
+    headers: list[tuple[str, bytes]]
 
 
 def serialize_payload(payload: object) -> str:
@@ -145,8 +145,8 @@ def encode(*, entity_key: str, payload: object, message_id: str) -> EncodedRecor
     return EncodedRecord(
         key=entity_key.encode("utf-8"),
         value=value.encode("utf-8"),
-        headers=(
+        headers=[
             ("format_version", FORMAT_VERSION.encode("utf-8")),
             ("message_id", message_id.encode("utf-8")),
-        ),
+        ],
     )

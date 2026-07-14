@@ -59,6 +59,31 @@ def test_fake_producer_rejects_unknown_ctor_kwargs() -> None:
         FakeProducer(InMemoryKafka(), definitely_not_a_real_kwarg=1)  # type: ignore[call-arg]
 
 
+async def test_fake_producer_requires_list_headers() -> None:
+    """Faithful to the real client: aiokafka's (Cython) record-batch builder
+    raises ``TypeError: Expected list, got tuple`` for non-list ``headers``,
+    so the fake must too — otherwise a tuple slips past every fake-backed
+    test and only the real-broker e2e job catches it.
+    """
+    producer = FakeProducer(InMemoryKafka())
+    await producer.start()
+    with pytest.raises(TypeError):
+        # The tuple is the point: pin the runtime rejection the real client
+        # makes, so a non-list can't slip past fake-backed tests.
+        await producer.send_and_wait(
+            "t",
+            value=b"{}",
+            key=b"k",
+            partition=0,
+            headers=(("h", b"v"),),  # type: ignore[arg-type]
+        )
+    # A list is accepted (as is None).
+    await producer.send_and_wait(
+        "t", value=b"{}", key=b"k", partition=0, headers=[("h", b"v")]
+    )
+    await producer.stop()
+
+
 async def test_fake_producer_injectable_failure_and_bad_offset() -> None:
     kafka = InMemoryKafka()
 
