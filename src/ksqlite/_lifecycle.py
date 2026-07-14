@@ -264,17 +264,29 @@ class PartitionLifecycle:
                         f"{_wire.FORMAT_VERSION!r})"
                     )
                 assert isinstance(decoded, _wire.KsqliteRecord)
-                await _schema.apply_materialization(
+                # The byte-identical INSERT shared with the append path —
+                # that shared statement is what makes replay and write-path
+                # dedup provably equivalent (I2/I4). Replay does NOT run the
+                # per-record checkpoint upsert: one MAX() upsert per
+                # committed batch (below) produces the identical end state
+                # (spec §7 step 3; RH-37).
+                await _pool.execute(
                     conn,
-                    message_id=decoded.message_id,
-                    source_topic=tp.topic,
-                    source_partition=tp.partition,
-                    changelog_offset=record.offset,
-                    entity_key=decoded.entity_key,
-                    payload=decoded.payload,
+                    _schema.INSERT_RECORD_SQL,
+                    {
+                        "message_id": decoded.message_id,
+                        "source_topic": tp.topic,
+                        "source_partition": tp.partition,
+                        "changelog_offset": record.offset,
+                        "entity_key": decoded.entity_key,
+                        "payload": decoded.payload,
+                    },
                 )
-            # Skipped-foreign offsets still advance the checkpoint (spec §7),
-            # so a foreign tail cannot permanently defeat the fast path.
+            # ONE checkpoint upsert per committed batch, in the same
+            # transaction as its inserts (both-or-neither, I7). Pinned to the
+            # batch max offset: skipped-foreign offsets still advance the
+            # checkpoint (spec §7), so a foreign tail cannot permanently
+            # defeat the fast path.
             await _pool.execute(
                 conn,
                 _schema.CHECKPOINT_UPSERT_SQL,

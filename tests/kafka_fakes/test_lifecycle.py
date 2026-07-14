@@ -1498,3 +1498,34 @@ async def test_rh36_unreached_partition_with_warm_checkpoint_reports_lag(
     assert states[P3].checkpoint_offset == 4  # the persisted checkpoint
     assert states[P3].lag == 0  # 5 - (4+1): caught up, merely unreached
     assert await owned_rows(db) == {("messages", 1), ("messages", 3)}
+
+
+async def test_rh37_replay_batches_the_checkpoint_upsert(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """Replay advances the checkpoint ONCE per committed batch (spec §7
+    step 3): per-record MAX() upserts are redundant inside the batch
+    transaction — identical end state, N fewer statements per batch. The
+    dedup equivalence (I2/I4) rests on the byte-identical INSERT, which the
+    write and replay paths still share.
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 10)
+    recording = RecordingPool(db)
+    harness = LifecycleHarness(db, kafka, pool=recording, batch_size=4)
+
+    await harness.lifecycle.on_partitions_assigned([SOURCE])
+
+    upserts = [
+        sql
+        for sql in recording.executed
+        if sql.startswith("INSERT INTO partition_checkpoint")
+    ]
+    assert len(upserts) == 3  # one per batch (4 + 4 + 2), not one per record
+
+    # The end state is identical to the per-record form (MAX watermark, I3).
+    assert await checkpoint_of(db, SOURCE) == 9
+    assert len(await all_records(db)) == 10
+    assert harness.state.partition_states()[SOURCE].state is PartitionStatus.READY

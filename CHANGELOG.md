@@ -51,6 +51,9 @@ Changed:
   `list[T]`).
 - CI matrix is Python 3.10 + 3.14 (floor + latest; the 3.14 leg exercises
   the stdlib-`uuid7` branch).
+- Replay batches the checkpoint upsert: one `MAX()` upsert per committed
+  batch instead of one per record plus one per batch (identical end state;
+  the write path and the shared dedup `INSERT` are unchanged).
 
 ## 0.1.0 — 2026-07-14
 

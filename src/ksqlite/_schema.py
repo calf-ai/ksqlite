@@ -75,9 +75,11 @@ _BASE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_records_key ON _records(entity_key)",
 )
 
-# The materialization pair (spec §6) — the SINGLE home of this DML: _write
-# and _lifecycle run byte-identical statements, which is what makes replay
-# and write-path dedup provably equivalent (invariants I2/I4).
+# The materialization DML (spec §6/§7) — the SINGLE home of these
+# statements. _write and _lifecycle run the byte-identical INSERT, which is
+# what makes write-path dedup and replay dedup provably equivalent
+# (invariants I2/I4). The MAX() checkpoint upsert accompanies every append
+# (spec §6); replay batches it — one upsert per committed batch (§7 step 3).
 INSERT_RECORD_SQL = """\
 INSERT INTO _records(message_id, source_topic, source_partition,
                      changelog_offset, entity_key, payload)
@@ -124,7 +126,10 @@ async def apply_materialization(
     entity_key: str,
     payload: str,
 ) -> None:
-    """Run the materialization pair inside the caller's open transaction."""
+    """Run the append-path materialization pair (INSERT + checkpoint upsert)
+    inside the caller's open transaction (spec §6). Replay runs the same
+    INSERT but batches the upsert (§7 step 3).
+    """
     params = {
         "message_id": message_id,
         "source_topic": source_topic,

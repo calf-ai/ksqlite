@@ -9,8 +9,9 @@
 > `DESIGN-REVIEW-DECISIONS.md`, 2026-07-14 section) changed behaviors that some matrix rows
 > still describe in their original form — T-03, T-05b, T-07, T-08, F-10, E2E-05 (compact policy
 > is now detect-and-proceed, never `ConfigError`), RH-16 (the deadline is now checked on every
-> poll iteration), and the `_topics` module-tree note. For those IDs the test bodies and the
-> decisions log are the source of truth.
+> poll iteration), the `_topics` module-tree note, and the materialization-pair module-tree note
+> (replay now runs the byte-identical INSERT per record but ONE checkpoint upsert per committed
+> batch). For those IDs the test bodies and the decisions log are the source of truth.
 
 Implements `docs/DESIGN.md` (v1 spec, round-5). The spec is the **source of
 truth**; where this plan and the spec disagree, the spec wins and this plan must be corrected — or

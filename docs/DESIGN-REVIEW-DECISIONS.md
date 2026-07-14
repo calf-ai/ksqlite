@@ -463,10 +463,15 @@ branch `worktree-deep-review-fixes`.
     NOTE: aiosqlite's native `async with conn.execute(...)` idiom was deliberately NOT adopted —
     the test suite's `RecordingConnection.execute` is a plain coroutine, so the CM idiom would
     break every RecordingPool-proxied path.
-15. **[REC] Replay's per-record checkpoint upserts could collapse to one per batch** (N+1 → 1
-    MAX upserts; end state provably identical). NOT applied: spec §7 step 3 pins the per-record
-    "INSERT + MAX checkpoint upsert" pair and §13/I2/I4 lean on the byte-identical-pair framing —
-    needs an owner spec amendment first.
+15. **[LOCKED — owner, same day] Replay's per-record checkpoint upserts collapsed to one per
+    batch** (was [REC]: N+1 → 1 MAX upserts per batch; end state provably identical). Owner
+    approved the spec amendment: §7 step 3 now reads "the MAX checkpoint upsert runs once per
+    committed batch, inside the same transaction as the batch's inserts". The dedup-equivalence
+    framing (I2/I4) rests on the byte-identical INSERT, which write and replay still share; the
+    batch-level upsert already existed and remains what advances the checkpoint past
+    skipped-foreign offsets; the atomicity invariant (I7) holds — inserts + upsert commit in one
+    transaction. Write path unchanged. Pinned by RH-37 (statement count + end-state equivalence);
+    RH-07/RH-08/W-15 continue to pin the round-trip equivalence.
 16. **Skipped with rationale — busy-detection via `sqlite_errorcode`**: the attribute and the
     `sqlite3.SQLITE_*` result-code constants do not exist on Python 3.10 (project floor), and
     `sqlite_errorcode` returns EXTENDED codes (517 for BUSY_SNAPSHOT), so a naive `== 5` check

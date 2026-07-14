@@ -405,9 +405,12 @@ partition, in order:
    reconstruct the row: `entity_key = record.key.decode()`, `message_id`/`format_version` from
    **headers** (bytes-decoded), `changelog_offset = record.offset`, and
    `source_topic`/`source_partition` from the **assignment context** (never by parsing the topic
-   name). `INSERT INTO _records ... ON CONFLICT(message_id) DO NOTHING` + the `MAX` checkpoint upsert
-   (§6). Headers are looked up **by name** (order-insensitive; unknown extra headers — e.g. tracing —
-   are ignored). A record with a **missing/malformed `message_id` header, or a null/undecodable key or
+   name). `INSERT INTO _records ... ON CONFLICT(message_id) DO NOTHING` — byte-identical to the
+   append path's insert (that shared statement is what makes replay and write-path dedup
+   equivalent, §13). The `MAX` checkpoint upsert (§6) runs **once per committed batch**, inside the
+   same transaction as the batch's inserts (both-or-neither): per-record upserts would be redundant
+   under the MAX() watermark. Headers are looked up **by name** (order-insensitive; unknown extra
+   headers — e.g. tracing — are ignored). A record with a **missing/malformed `message_id` header, or a null/undecodable key or
    value** is **skipped + logged** (it can't be a KSQLite record — a foreign producer; delete-policy
    changelogs have no tombstones). A record carrying a valid `message_id` but a **missing or
    unrecognized `format_version`** is a KSQLite record this reader can't understand (rolling
