@@ -17,7 +17,11 @@ def _select_uuid7(version_info: tuple[int, int]) -> Callable[[], uuid.UUID]:
         return stdlib_uuid7
     from uuid6 import uuid7
 
-    return uuid7
+    # Annotated intermediate: on 3.14 uuid6 is absent (see its dependency
+    # marker), so mypy types this import as Any there — the annotation keeps
+    # the return type honest without a version-fragile per-line ignore.
+    backport_uuid7: Callable[[], uuid.UUID] = uuid7
+    return backport_uuid7
 
 
 _uuid7 = _select_uuid7((sys.version_info[0], sys.version_info[1]))
