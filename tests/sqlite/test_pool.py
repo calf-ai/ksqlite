@@ -128,19 +128,25 @@ async def test_c04_sqlite_busy_bounded_retry_raises_storage_error(
     async def recording_sleep(delay: float) -> None:
         sleeps.append(delay)  # records, never waits: deterministic backoff
 
-    runner = _pool.TransactionRunner(busy_timeout=0.2, backoff_sleep=recording_sleep)
+    # The runner's deadline (2x ITS busy_timeout) is deliberately DECOUPLED
+    # from the fixture connections' 0.2 s PRAGMA wait: on a slow CI runner a
+    # single busy-blocked BEGIN can consume a tight deadline before any
+    # backoff runs (observed on GitHub macOS runners: "after 1 attempts",
+    # zero sleeps). With a generous deadline the ATTEMPT CAP is what binds —
+    # deterministically, on any machine.
+    runner = _pool.TransactionRunner(busy_timeout=30.0, backoff_sleep=recording_sleep)
 
     async def work(c: aiosqlite.Connection) -> None:
         await c.execute("INSERT INTO t VALUES ('x')")
 
     start = time.monotonic()
-    with pytest.raises(StorageError):
+    with pytest.raises(StorageError, match="after 3 attempts"):
         await runner.run(conn, work)
     elapsed = time.monotonic() - start
 
-    # Loose bounds only (plan C-04): each BEGIN waits at most the 0.2 s
-    # busy_timeout inside SQLite; the total deadline is ~2x busy_timeout.
-    assert elapsed < 1.5
+    # Loose bound only (plan C-04): 3 attempts x the 0.2 s PRAGMA wait plus
+    # scheduling jitter — proves boundedness, not timing.
+    assert elapsed < 10
     assert sleeps, "bounded retry must back off between attempts"
     assert not conn.in_transaction
 
@@ -159,7 +165,9 @@ async def test_c05_retry_succeeds_when_lock_frees(two_conns: ConnPair) -> None:
         if blocker.in_transaction:
             await blocker.rollback()
 
-    runner = _pool.TransactionRunner(busy_timeout=0.2, backoff_sleep=releasing_sleep)
+    # Generous deadline (see C-04): the backoff — which is what frees the
+    # lock — must be guaranteed to run regardless of runner speed.
+    runner = _pool.TransactionRunner(busy_timeout=30.0, backoff_sleep=releasing_sleep)
 
     async def work(c: aiosqlite.Connection) -> str:
         await c.execute("INSERT INTO t VALUES ('x')")

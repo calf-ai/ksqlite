@@ -213,6 +213,11 @@ async def test_e2e11_live_concurrent_reads_during_big_rehydrate(
     rehydrate_start event — a pre-assignment sample is vacuous) and >=1
     complete-phase sample (full count). The ~20k preload keeps the hidden
     window wide.
+
+    The oracle is the atomic-reveal INVARIANT, not a phase label: a sample
+    may race the reveal (the assign task can finish between the done() check
+    and the query landing) and legally observe the FULL count — so every
+    sample must be 0 or PRELOAD, never a between state.
     """
     bootstrap = broker.get_bootstrap_server()
     source = TopicPartition(unique("src"), 0)
@@ -233,7 +238,7 @@ async def test_e2e11_live_concurrent_reads_during_big_rehydrate(
 
     store = make_store(tmp_path / "s.db", bootstrap)
     await store.start()
-    hidden_samples: list[int] = []
+    samples: list[int] = []
     try:
         assign_task = asyncio.ensure_future(store.on_partitions_assigned([source]))
 
@@ -241,15 +246,18 @@ async def test_e2e11_live_concurrent_reads_during_big_rehydrate(
             while not assign_task.done():
                 if rehydrate_started.is_set():
                     rows = await store.query("SELECT COUNT(*) AS n FROM records")
-                    hidden_samples.append(int(rows[0]["n"]))
+                    samples.append(int(rows[0]["n"]))
                 await asyncio.sleep(0.01)
 
         reader_task = asyncio.ensure_future(reader())
         await assign_task
         await reader_task
 
-        assert hidden_samples, "no sample taken during the rehydrate window"
-        assert all(n == 0 for n in hidden_samples)  # excluded, never partial
+        assert samples, "no sample taken during the rehydrate window"
+        assert 0 in samples, "no hidden-phase sample observed"
+        # I5, race-free: the reveal is atomic, so a concurrent reader ever
+        # sees nothing or everything — NEVER a between state.
+        assert set(samples) <= {0, PRELOAD}, f"partial read observed: {set(samples)}"
 
         final = await store.query("SELECT COUNT(*) AS n FROM records")
         assert final[0]["n"] == PRELOAD  # the complete-phase sample
