@@ -14,8 +14,7 @@ fleet.
 
 KSQLite is an embeddable library, not a service. It does not own source-topic
 consumption — your application keeps its own consumer and hooks KSQLite into
-its rebalance listener. For the full design, guarantees, and rationale, read
-[`docs/DESIGN.md`](docs/DESIGN.md).
+its rebalance listener.
 
 ## Requirements
 
@@ -62,7 +61,7 @@ its rebalance listener. For the full design, guarantees, and rationale, read
    consumer = AIOKafkaConsumer(
        bootstrap_servers="localhost:9092",
        group_id="my-app",
-       enable_auto_commit=True,   # at-most-once source consumption (spec §2)
+       enable_auto_commit=True,   # at-most-once source consumption
        auto_offset_reset="earliest",
    )
    await consumer.start()
@@ -111,42 +110,23 @@ its rebalance listener. For the full design, guarantees, and rationale, read
 5. **Shut down** with `await store.stop()` — it drains in-flight appends and
    flushes the changelog producer.
 
-## Observing partition state
-
-`store.partition_states()` (synchronous) returns a
-`dict[TopicPartition, PartitionState]` with each partition's live status
-(`RESTORING`, `READY`, `READY_PARTIAL`, `STANDBY`), its live checkpoint
-offset, and the log-end/lag values cached at the last rehydrate. A
-`READY_PARTIAL` partition was force-stopped at the replay budget and serves
-partial state — see `docs/DESIGN.md` §7.
-
-KSQLite logs structured events on the `ksqlite.*` loggers (a `NullHandler` is
-installed; enable INFO to see them). Events carry an `event` field —
-`rehydrate_start`, `rehydrate_end`, `rehydrate_force_stop`,
-`truncation_reset`, `checkpoint_clamped`, `foreign_record_skipped`,
-`produce_failure`, `append_to_non_ready`, and more. The truncation reset and
-checkpoint clamps are WARNING-level and operator-actionable.
-
 ## Operational contract (the short version)
-
-Full details: `docs/DESIGN.md` §10 and §13–§16.
 
 - **Changelog topics** are one per source `(topic, partition)`,
   single-partition, `cleanup.policy=delete` — **never compact** (compaction
   would collapse an entity to its last message). KSQLite fails fast on a
-  compact changelog at the partition's first assignment; remediation is
-  documented in §10.
+  compact changelog at the partition's first assignment; recreate the topic
+  with `cleanup.policy=delete` to remediate.
 - **Retention bounds rehydrate completeness** — a source-of-truth log wants
   long or infinite retention.
 - **Best-effort, not end-to-end crash-durable.** Committed SQLite state
-  persists across restarts, but two accepted loss windows (at the
-  consume/produce boundary) and the duplicate taxonomy are documented in §14.
-  In particular: **do not retry a failed `append()`** — the retry mints a new
-  `message_id`, and if the first produce was a phantom the record materializes
-  twice. A produce-acked / local-write-failed append self-heals on the next
-  rehydrate.
+  persists across restarts, but there are two accepted loss windows (at the
+  consume/produce boundary) and a duplicate taxonomy. In particular: **do not
+  retry a failed `append()`** — the retry mints a new `message_id`, and if the
+  first produce was a phantom the record materializes twice. A produce-acked /
+  local-write-failed append self-heals on the next rehydrate.
 - **Repartitioning** a source topic breaks partition-scoped local state; the
-  partition count is assumed fixed (§2).
+  partition count is assumed fixed.
 
 ## Older SQLite runtimes
 
@@ -165,15 +145,6 @@ sys.modules["sqlite3"] = pysqlite3
 Caveat: `pysqlite3-binary` publishes wheels for **linux/x86_64 only**; on
 other platforms run an interpreter linking a newer SQLite. The `start()`
 version check catches every miss loudly.
-
-## Documentation map
-
-- [`docs/DESIGN.md`](docs/DESIGN.md) — the v1 specification: architecture,
-  data model, write/rehydrate/read paths, guarantees and non-guarantees.
-- [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) — the build
-  plan and the authoritative test matrix.
-- [`docs/DESIGN-REVIEW-DECISIONS.md`](docs/DESIGN-REVIEW-DECISIONS.md) — the
-  decision audit trail.
 
 ## Development
 

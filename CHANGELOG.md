@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-07-14
 
-Initial release, implementing `docs/DESIGN.md` (v1 spec, round-5) in full.
+Initial release, implementing the v1 spec (round-5) in full.
 
 - `KSQLite` store facade: `start`/`stop` (drain + best-effort close), async
   context manager, keyword-only `append`, auto-scoped `query` with optional
