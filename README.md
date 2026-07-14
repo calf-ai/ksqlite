@@ -1,11 +1,12 @@
 # KSQLite
 
+*The Kafka Streams state-store + changelog pattern, hand-rolled with SQLite in
+place of RocksDB — so your materialized view is queryable with real SQL.*
+
 A library that gives a Kafka-consuming application a **local, SQL-queryable,
 rebuildable materialized view**, backed durably by a per-partition Kafka
 **changelog**. Local state lives in SQLite; when the host consumer rebalances,
 the state for a reassigned partition is rehydrated by replaying its changelog.
-It is a hand-rolled Kafka Streams state-store + changelog pattern, with SQLite
-(for real SQL querying) in place of RocksDB.
 
 KSQLite is an embeddable library, not a service. It does not own source-topic
 consumption — your application keeps its own consumer and hooks KSQLite into
@@ -17,8 +18,8 @@ its rebalance listener. For the full design, guarantees, and rationale, read
 - Python >= 3.10
 - SQLite >= 3.38 linked into your interpreter (`start()` fails fast with
   `SQLiteVersionError` otherwise — see [Older SQLite runtimes](#older-sqlite-runtimes))
-- A Kafka-compatible broker (tested against Redpanda; `acks=1` and
-  idempotence-off defaults are Tansu-compatible)
+- A Kafka-compatible broker (tested against Redpanda; the defaults — `acks=1`,
+  idempotence off — also work with lightweight brokers like Tansu)
 
 ## Quickstart: materialize a topic and query it
 
@@ -78,7 +79,8 @@ its rebalance listener. For the full design, guarantees, and rationale, read
    ```
 
 4. **Query with plain SQL** against the auto-scoped `records` view (it shows
-   only partitions this process currently owns and has finished revealing):
+   only partitions this process currently owns and has finished loading —
+   rehydrate completed and the partition was atomically revealed to the view):
 
    ```python
    rows = await store.query(
@@ -127,10 +129,11 @@ Full details: `docs/DESIGN.md` §10 and §13–§16.
 
 - **Changelog topics** are one per source `(topic, partition)`,
   single-partition, `cleanup.policy=delete` — **never compact** (compaction
-  would collapse an entity to its last message). KSQLite fail-fasts on a
+  would collapse an entity to its last message). KSQLite fails fast on a
   compact changelog at the partition's first assignment; remediation is
-  documented in §10. Retention bounds rehydrate completeness — a
-  source-of-truth log wants long or infinite retention.
+  documented in §10.
+- **Retention bounds rehydrate completeness** — a source-of-truth log wants
+  long or infinite retention.
 - **Best-effort, not crash-durable.** Two accepted loss windows and the
   duplicate taxonomy are documented in §14. In particular: **do not retry a
   failed `append()`** — the retry mints a new `message_id`, and if the first
@@ -178,3 +181,8 @@ uv run ruff check && uv run ruff format --check && uv run mypy
 The end-to-end suite runs against a pinned Redpanda container
 (`docker.redpanda.com/redpandadata/redpanda:v24.2.20`) and auto-skips when
 Docker is unavailable.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE)
+file for details.
