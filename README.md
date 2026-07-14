@@ -1,12 +1,16 @@
 # KSQLite
 
-*The Kafka Streams state-store + changelog pattern, hand-rolled with SQLite in
-place of RocksDB — so your materialized view is queryable with real SQL.*
+*Turn SQLite into a distributed, durable store for your Kafka consumers:
+millisecond-local SQL on every instance, with Kafka distributing your data
+across the fleet and rehydrating it on demand.*
 
-A library that gives a Kafka-consuming application a **local, SQL-queryable,
-rebuildable materialized view**, backed durably by a per-partition Kafka
-**changelog**. Local state lives in SQLite; when the host consumer rebalances,
-the state for a reassigned partition is rehydrated by replaying its changelog.
+KSQLite gives each instance of your Kafka-consuming app a fast, local SQLite
+database of the partitions it owns — durable on disk and queryable with plain
+SQL. Kafka is the distribution and recovery layer: a per-partition
+**changelog** carries every write and lives on the network, so a new or
+rebalanced instance rehydrates its local SQLite by replaying that changelog.
+Your data isn't pinned to one box — it follows partition ownership across the
+fleet.
 
 KSQLite is an embeddable library, not a service. It does not own source-topic
 consumption — your application keeps its own consumer and hooks KSQLite into
@@ -134,11 +138,13 @@ Full details: `docs/DESIGN.md` §10 and §13–§16.
   documented in §10.
 - **Retention bounds rehydrate completeness** — a source-of-truth log wants
   long or infinite retention.
-- **Best-effort, not crash-durable.** Two accepted loss windows and the
-  duplicate taxonomy are documented in §14. In particular: **do not retry a
-  failed `append()`** — the retry mints a new `message_id`, and if the first
-  produce was a phantom the record materializes twice. A produce-acked /
-  local-write-failed append self-heals on the next rehydrate.
+- **Best-effort, not end-to-end crash-durable.** Committed SQLite state
+  persists across restarts, but two accepted loss windows (at the
+  consume/produce boundary) and the duplicate taxonomy are documented in §14.
+  In particular: **do not retry a failed `append()`** — the retry mints a new
+  `message_id`, and if the first produce was a phantom the record materializes
+  twice. A produce-acked / local-write-failed append self-heals on the next
+  rehydrate.
 - **Repartitioning** a source topic breaks partition-scoped local state; the
   partition count is assumed fixed (§2).
 
