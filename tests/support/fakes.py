@@ -31,6 +31,17 @@ class _DescribeConfigsResponse:
     resources: list[tuple[int, str | None, int, str, list[tuple[Any, ...]]]]
 
 
+@dataclass(frozen=True)
+class _CreateTopicsResponse:
+    """Mirrors the real response surface: per-topic outcomes come back as
+    ``topic_errors`` entries of (topic, error_code, error_message) — the
+    real client returns them and NEVER raises them (pinned by CF-08 and
+    tests/unit/test_fakes.py).
+    """
+
+    topic_errors: list[tuple[str, int, str | None]]
+
+
 @dataclass
 class MutableClock:
     """Scripted clock (plan §4.2): the fake consumer advances it per poll via
@@ -287,12 +298,17 @@ class FakeAdmin:
         kafka: InMemoryKafka,
         *,
         describe_fail_with: BaseException | None = None,
+        describe_error_code: int | None = None,
+        create_error_code: int | None = None,
         bootstrap_servers: str | None = None,
     ) -> None:
         self._kafka = kafka
         self._describe_fail_with = describe_fail_with
+        self._describe_error_code = describe_error_code
+        self._create_error_code = create_error_code
         self.bootstrap_servers = bootstrap_servers
         self.describe_calls = 0
+        self.create_calls = 0
         self.started = False
         self.closed = False
 
@@ -305,15 +321,31 @@ class FakeAdmin:
     async def list_topics(self) -> list[str]:
         return self._kafka.topic_names()
 
-    async def create_topics(self, new_topics: list[Any]) -> None:
+    async def create_topics(self, new_topics: list[Any]) -> _CreateTopicsResponse:
+        # Per-topic outcomes are response error codes, never raises — the
+        # real client's create_topics does not inspect topic_errors.
+        self.create_calls += 1
+        topic_errors: list[tuple[str, int, str | None]] = []
         for topic in new_topics:
+            if self._create_error_code is not None:
+                topic_errors.append((topic.name, self._create_error_code, "injected"))
+                continue
             if self._kafka.topic_exists(topic.name):
-                raise TopicAlreadyExistsError(f"topic {topic.name!r} exists")
+                topic_errors.append(
+                    (
+                        topic.name,
+                        TopicAlreadyExistsError.errno,
+                        f"topic {topic.name!r} exists",
+                    )
+                )
+                continue
             self._kafka.create_topic(
                 topic.name,
                 num_partitions=topic.num_partitions,
                 configs=dict(topic.topic_configs or {}),
             )
+            topic_errors.append((topic.name, 0, None))
+        return _CreateTopicsResponse(topic_errors=topic_errors)
 
     async def describe_configs(
         self, config_resources: list[Any]
@@ -321,6 +353,17 @@ class FakeAdmin:
         self.describe_calls += 1
         if self._describe_fail_with is not None:
             raise self._describe_fail_with
+        if self._describe_error_code is not None:
+            # Broker-reported failures (authz denials included) come back as
+            # per-resource error codes with EMPTY config entries.
+            return [
+                _DescribeConfigsResponse(
+                    resources=[
+                        (self._describe_error_code, "injected error", 2, r.name, [])
+                        for r in config_resources
+                    ]
+                )
+            ]
         resources: list[tuple[int, str | None, int, str, list[tuple[Any, ...]]]] = []
         for resource in config_resources:
             name = resource.name
@@ -401,6 +444,10 @@ class FakeProducer:
         partition: int | None = None,
         headers: list[tuple[str, bytes]] | None = None,
     ) -> RecordMetadata:
+        if headers is not None and not isinstance(headers, list):
+            # Faithful to aiokafka's (Cython) record-batch builder, which
+            # rejects a non-list here with exactly this message.
+            raise TypeError(f"Expected list, got {type(headers).__name__}")
         if self._delay_gate is not None:
             gate, self._delay_gate = self._delay_gate, None
             await gate.pass_through()

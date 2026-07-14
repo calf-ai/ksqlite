@@ -222,9 +222,13 @@ async def test_e2e03_warm_handoff_incremental(
     await store_a.stop()
 
 
-async def test_e2e05_compact_policy_live(broker: Any, tmp_path: Path) -> None:
-    from ksqlite.errors import ConfigError
-
+async def test_e2e05_compact_policy_live(
+    broker: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The policy check is best-effort (spec §10): a live compact changelog
+    is reported loudly (``compact_policy_detected``) and the assignment
+    proceeds — verified against a real broker's describe_configs shape.
+    """
     bootstrap = broker.get_bootstrap_server()
     source = TopicPartition(unique("src"), 0)
     changelog = changelog_of(source)
@@ -246,29 +250,16 @@ async def test_e2e05_compact_policy_live(broker: Any, tmp_path: Path) -> None:
         )
 
         async with make_store(tmp_path / "s.db", bootstrap) as store:
-            with pytest.raises(ConfigError):
-                await store.on_partitions_assigned([source])
-
-        # Remediation (spec §10): the policy is dynamically alterable;
-        # alter_configs REPLACES the topic's config set — fine on a fresh
-        # test topic.
-        await admin.alter_configs(
-            [
-                ConfigResource(
-                    ConfigResourceType.TOPIC,
-                    changelog,
-                    configs={"cleanup.policy": "delete"},
-                )
-            ]
-        )
+            with caplog.at_level(logging.ERROR, logger="ksqlite.topics"):
+                await store.on_partitions_assigned([source])  # NO raise
+            assert any(
+                getattr(r, "event", None) == "compact_policy_detected"
+                for r in caplog.records
+            )
+            rows = await store.query("SELECT COUNT(*) AS n FROM records")
+            assert rows[0]["n"] == 0
     finally:
         await admin.close()
-
-    # A FRESH store instance then assigns successfully (plan E2E-05: no
-    # retry-after-failed-assignment semantics needed).
-    async with make_store(tmp_path / "s2.db", bootstrap) as fresh:
-        await fresh.on_partitions_assigned([source])
-        assert (await fresh.query("SELECT COUNT(*) AS n FROM records"))[0]["n"] == 0
 
 
 async def test_e2e06_auto_create_config(broker: Any, tmp_path: Path) -> None:

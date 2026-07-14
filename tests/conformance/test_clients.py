@@ -1,4 +1,4 @@
-"""Conformance suite CF-01..CF-07 (plan §4.3): ONE set of test bodies,
+"""Conformance suite CF-01..CF-08 (plan §4.3): ONE set of test bodies,
 executed against the fakes always and the real client under ``-m e2e`` —
 fake<->real divergence breaks mechanically, not by review.
 """
@@ -210,3 +210,33 @@ async def test_cf06_describe_configs_resources_walking(kafka_env: KafkaEnv) -> N
 async def test_cf07_unknown_ctor_kwarg_is_a_typeerror(kafka_env: KafkaEnv) -> None:
     with pytest.raises(TypeError):
         kafka_env.new_consumer(definitely_not_a_real_kwarg=1)
+
+
+async def test_cf08_create_topics_reports_per_topic_error_codes(
+    kafka_env: KafkaEnv,
+) -> None:
+    """``create_topics`` NEVER raises per-topic outcomes — they come back as
+    ``topic_errors`` entries of (topic, error_code[, error_message]): 0 on
+    success, 36 (TopicAlreadyExists) when losing a create race. KSQLite's
+    step 0 depends on walking these codes (spec §7 step 0).
+    """
+    from aiokafka.admin import NewTopic
+    from aiokafka.errors import TopicAlreadyExistsError
+
+    topic = kafka_env.unique_topic("cf08")
+    admin = kafka_env.new_admin()
+    await admin.start()
+    try:
+        first = await admin.create_topics(
+            [NewTopic(topic, num_partitions=1, replication_factor=1)]
+        )
+        codes = {t: c for t, c, *_ in first.topic_errors}
+        assert codes[topic] == 0
+
+        duplicate = await admin.create_topics(
+            [NewTopic(topic, num_partitions=1, replication_factor=1)]
+        )
+        codes = {t: c for t, c, *_ in duplicate.topic_errors}
+        assert codes[topic] == TopicAlreadyExistsError.errno  # 36, NO raise
+    finally:
+        await admin.close()

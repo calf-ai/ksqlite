@@ -1,7 +1,7 @@
 """Identifier/json-path validation, escaping, and DDL emission (plan §3
 ``_sql``; spec §4 config validation, §5.1 DDL).
 
-Pure module: no I/O. Grown red-first by S-01..S-10.
+Pure module: no I/O.
 """
 
 import re
@@ -49,12 +49,23 @@ _KAFKA_TOPIC_NAME_MAX = 249
 
 
 def validate_changelog_template(template: str) -> None:
-    """The template must carry both placeholders (spec §4)."""
+    """The template must carry both placeholders (spec §4) — and format
+    cleanly with exactly those two: an unknown placeholder or malformed
+    brace must fail HERE as ConfigError, not as a raw KeyError/ValueError
+    out of the first rebalance callback (F-01 fail-fast).
+    """
     if "{source_topic}" not in template or "{partition}" not in template:
         raise ConfigError(
             "changelog_topic_template must contain both {source_topic} and "
             f"{{partition}}: {template!r}"
         )
+    try:
+        template.format(source_topic="probe", partition=0)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ConfigError(
+            f"changelog_topic_template is not a usable format template:"
+            f" {template!r} ({exc})"
+        ) from exc
 
 
 def validate_topic_name(name: str) -> None:

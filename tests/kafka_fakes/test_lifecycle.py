@@ -1,4 +1,4 @@
-"""P8 `_lifecycle` tests: RH-01..RH-28 + T-07 + W-12b (plan §5 P8).
+"""P8 `_lifecycle` tests: RH-01..RH-36 + T-07 + W-12b (plan §5 P8).
 Fakes + real SQLite.
 """
 
@@ -557,8 +557,8 @@ def test_rh11_checkpoint_never_decreases_except_via_clamps(
 
 
 async def test_rh12_batching_boundaries(db: _pool.AiosqlitePoolAdapter) -> None:
-    """Batch size B, N = 2.5xB => exactly 3 transactions (commit events
-    counted through the RecordingPool)."""
+    """Batch size B, N = 2.5xB => exactly 3 batch transactions plus the
+    reveal transaction (commit events counted through the RecordingPool)."""
     from tests.support.recording_pool import RecordingPool
 
     kafka = InMemoryKafka()
@@ -568,7 +568,8 @@ async def test_rh12_batching_boundaries(db: _pool.AiosqlitePoolAdapter) -> None:
 
     await harness.lifecycle.on_partitions_assigned([SOURCE])
 
-    assert recording.events.count("txn_commit") == 3  # 4 + 4 + 2
+    # 3 batch transactions (4 + 4 + 2 records) + the reveal transaction.
+    assert recording.events.count("txn_commit") == 4
     assert len(await all_records(db)) == 10
 
 
@@ -742,8 +743,8 @@ async def test_rh15_assignment_wide_budget_force_stop(
 async def test_rh16_force_stop_is_cooperative_no_rollback(
     db: _pool.AiosqlitePoolAdapter,
 ) -> None:
-    """The deadline is checked BETWEEN batches, never by cancelling a
-    coroutine mid-transaction: no rollback events anywhere (spec §7).
+    """The deadline is checked on every poll iteration, never by cancelling
+    a coroutine mid-transaction: no rollback events anywhere (spec §7).
     """
     _harness, recording, _clock = await _budget_choreography(db)
     assert "rollback" not in recording.events
@@ -1070,15 +1071,17 @@ async def test_rh28_mid_assignment_failure_leaves_the_rest_hidden(
 
 
 async def test_t07_fast_path_still_runs_step0(
-    db: _pool.AiosqlitePoolAdapter,
+    db: _pool.AiosqlitePoolAdapter, caplog: object
 ) -> None:
     """Warm checkpoint == log-end on a store's FIRST assignment + compact
-    policy => ConfigError: step 0 is unconditional, never skipped by the
-    fast path (spec §7).
+    policy => the best-effort policy check still runs and reports: step 0 is
+    unconditional, never skipped by the fast path (spec §7).
     """
+    import logging
+
     import pytest
 
-    from ksqlite.errors import ConfigError
+    assert isinstance(caplog, pytest.LogCaptureFixture)
 
     kafka = InMemoryKafka()
     kafka.create_topic(
@@ -1091,9 +1094,15 @@ async def test_t07_fast_path_still_runs_step0(
     await warmer.lifecycle.on_partitions_revoked([SOURCE])
 
     fresh_store = LifecycleHarness(db, kafka, verify=True)
-    with pytest.raises(ConfigError):  # fast-path eligible, still checked
+    with caplog.at_level(logging.ERROR, logger="ksqlite.topics"):
         await fresh_store.lifecycle.on_partitions_assigned([SOURCE])
-    assert await owned_rows(db) == set()
+
+    # Fast-path eligible, still checked (and reported) — then revealed.
+    assert any(
+        getattr(r, "event", None) == "compact_policy_detected" for r in caplog.records
+    )
+    assert fresh_store.admin.describe_calls == 1
+    assert await owned_rows(db) == {("messages", 3)}
 
 
 async def test_w12b_produce_ok_apply_failed_self_heals(
@@ -1193,3 +1202,330 @@ async def test_rh22_watermark_gap_semantics(
         assert [r[2] for r in await all_records(cold_pool)] == [0, 1]
     finally:
         await cold_pool.close()
+
+
+# -- post-v1 deep-review regression tests (RH-29..RH-34) ----------------------
+
+
+async def test_rh29_fast_path_seeds_in_memory_checkpoint(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """Warm restart + zero-fetch fast path: ``partition_states()`` must
+    report the persisted checkpoint and lag 0 — not ``checkpoint_offset is
+    None`` / ``lag == LEO`` (spec §4: state and checkpoint_offset are live).
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 6)
+    first_stack = LifecycleHarness(db, kafka)
+    await first_stack.lifecycle.on_partitions_assigned([SOURCE])
+    assert await checkpoint_of(db, SOURCE) == 5
+
+    # "Process restart": a fresh stack with an EMPTY in-memory state machine
+    # on the same DB; checkpoint+1 == LEO -> the zero-fetch fast path.
+    second_stack = LifecycleHarness(db, kafka)
+    await second_stack.lifecycle.on_partitions_assigned([SOURCE])
+
+    state = second_stack.state.partition_states()[SOURCE]
+    assert state.state is PartitionStatus.READY
+    assert state.checkpoint_offset == 5  # seeded from the persisted row
+    assert state.lag == 0  # LEO(6) - (5+1)
+
+
+async def test_rh30_failed_consumer_start_is_not_cached(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """A rehydrate-consumer ``start()`` failure must not poison the
+    lifecycle: the dead client is stopped best-effort and NOT cached, so the
+    next assignment gets a fresh consumer.
+    """
+    import pytest
+    from aiokafka.errors import KafkaConnectionError
+
+    from ksqlite.errors import RehydrateError
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 3)
+
+    class UnstartableConsumer:
+        """start() fails; any other use means the dead client was reused."""
+
+        stop_calls = 0
+
+        async def start(self) -> None:
+            raise KafkaConnectionError("injected: broker unreachable")
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+
+    made: list[object] = []
+
+    def factory() -> object:
+        consumer: object = (
+            UnstartableConsumer()
+            if not made
+            else FakeConsumer(
+                kafka,
+                group_id=None,
+                enable_auto_commit=False,
+                auto_offset_reset="none",
+            )
+        )
+        made.append(consumer)
+        return consumer
+
+    lifecycle = _lifecycle.PartitionLifecycle(
+        pool=db,
+        consumer_factory=factory,
+        topics=_topics.ChangelogTopics(
+            admin=FakeAdmin(kafka),
+            template=TEMPLATE,
+            create_topics_retention_ms=None,
+            verify_changelog_policy=True,
+        ),
+        state=_state.PartitionStateMachine(),
+        txn_runner=_pool.TransactionRunner(busy_timeout=0.5),
+        rehydrate_timeout=30.0,
+    )
+
+    with pytest.raises(RehydrateError):
+        await lifecycle.on_partitions_assigned([SOURCE])
+
+    unstartable = made[0]
+    assert isinstance(unstartable, UnstartableConsumer)
+    assert unstartable.stop_calls == 1  # best-effort cleanup of the dead client
+
+    await lifecycle.on_partitions_assigned([SOURCE])  # fresh consumer, converges
+    assert len(made) == 2
+    assert len(await all_records(db)) == 3
+    states = lifecycle._state.partition_states()  # noqa: SLF001
+    assert states[SOURCE].state is PartitionStatus.READY
+
+
+async def test_rh31_deadline_enforced_on_empty_polls(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """Empty fetches must not extend the replay budget: the deadline is
+    checked on EVERY poll iteration, so a degraded broker returning ``{}``
+    cannot hold the rebalance callback past ``rehydrate_timeout`` (spec §7).
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 8)
+    clock = MutableClock()
+
+    def configure(consumer: FakeConsumer) -> None:
+        def on_poll() -> None:
+            clock.advance(6.0)
+            if consumer.getmany_calls == 2:
+                consumer.inject_spurious_empty_poll()
+
+        consumer.on_poll = on_poll
+
+    harness = LifecycleHarness(
+        db,
+        kafka,
+        batch_size=4,
+        rehydrate_timeout=10.0,
+        clock=clock,
+        configure_consumer=configure,
+    )
+
+    await harness.lifecycle.on_partitions_assigned([SOURCE])
+
+    # Poll 1 (t=6): records 0-3 committed; t < deadline -> continue.
+    # Poll 2 (t=12): an EMPTY fetch past the deadline -> force-stop.
+    state = harness.state.partition_states()[SOURCE]
+    assert state.state is PartitionStatus.READY_PARTIAL
+    assert await checkpoint_of(db, SOURCE) == 3  # the committed frontier
+    assert len(await all_records(db)) == 4
+    assert await owned_rows(db) == {("messages", 3)}  # revealed partial
+
+
+async def test_rh32_deadline_enforced_after_truncation_reset(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """The OOR reset path must also observe the deadline: a truncation reset
+    landing past the budget force-stops instead of replaying (spec §7). The
+    kept checkpoint is unchanged — clamps run only on completed replays.
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 3)
+    warm = LifecycleHarness(db, kafka)
+    await warm.lifecycle.on_partitions_assigned([SOURCE])  # checkpoint 2
+    await warm.lifecycle.on_partitions_revoked([SOURCE])
+
+    await seed_changelog(kafka, CHANGELOG, 5, start_index=3)  # LEO 8
+    kafka.trim(CHANGELOG, 0, before_offset=5)  # log_start 5 > checkpoint+1
+
+    clock = MutableClock()
+    harness = LifecycleHarness(
+        db,
+        kafka,
+        rehydrate_timeout=5.0,
+        clock=clock,
+        on_poll=lambda: clock.advance(6.0),
+    )
+
+    await harness.lifecycle.on_partitions_assigned([SOURCE])
+
+    # Poll 1 (t=6): OOR -> reset to earliest; t >= deadline -> force-stop.
+    state = harness.state.partition_states()[SOURCE]
+    assert state.state is PartitionStatus.READY_PARTIAL
+    assert await checkpoint_of(db, SOURCE) == 2  # unchanged: no clamp ran
+    assert len(await all_records(db)) == 3  # nothing replayed post-reset
+    assert await owned_rows(db) == {("messages", 3)}
+
+
+async def test_rh33_revoke_db_failure_maps_to_storage_error(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """A SQLite failure in the revoke hook surfaces as the documented
+    ``StorageError``, never a raw sqlite3 error (spec §4 boundary mapping).
+    """
+    import pytest
+
+    from ksqlite.errors import StorageError
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 2)
+    recording = RecordingPool(db)
+    harness = LifecycleHarness(db, kafka, pool=recording)
+    await harness.lifecycle.on_partitions_assigned([SOURCE])
+
+    recording.fail_on(lambda sql: sql.startswith("DELETE FROM _owned"))
+    with pytest.raises(StorageError):
+        await harness.lifecycle.on_partitions_revoked([SOURCE])
+
+
+async def test_rh34_reveal_and_checkpoint_read_failures_map_to_rehydrate_error(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """Mid-replay DB failures on the reveal INSERT and the checkpoint SELECT
+    are boundary-mapped like every other replay error: ``RehydrateError``
+    with the cause chained, partition NOT revealed (spec §4).
+    """
+    import pytest
+
+    from ksqlite.errors import RehydrateError
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 2)
+
+    recording = RecordingPool(db)
+    harness = LifecycleHarness(db, kafka, pool=recording)
+    recording.fail_on(lambda sql: sql.startswith("INSERT OR IGNORE INTO _owned"))
+    with pytest.raises(RehydrateError):
+        await harness.lifecycle.on_partitions_assigned([SOURCE])
+    assert await owned_rows(db) == set()  # NOT revealed
+
+    recording2 = RecordingPool(db)
+    harness2 = LifecycleHarness(db, kafka, pool=recording2)
+    recording2.fail_on(lambda sql: sql.startswith("SELECT changelog_offset"))
+    with pytest.raises(RehydrateError):
+        await harness2.lifecycle.on_partitions_assigned([SOURCE])
+    assert await owned_rows(db) == set()
+
+
+async def test_rh35_clamp_db_failure_maps_to_rehydrate_error(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """The post-reset checkpoint clamp is part of replay: its DB failure
+    maps to ``RehydrateError`` (partition stays hidden this assignment).
+    """
+    import pytest
+
+    from ksqlite.errors import RehydrateError
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 4)
+    recording = RecordingPool(db)
+    warm = LifecycleHarness(db, kafka, pool=recording)
+    await warm.lifecycle.on_partitions_assigned([SOURCE])  # checkpoint 3
+    await warm.lifecycle.on_partitions_revoked([SOURCE])
+
+    # Regress the log end below the checkpoint: recreate the topic empty.
+    kafka.delete_topic(CHANGELOG)
+    kafka.create_topic(
+        CHANGELOG, num_partitions=1, configs={"cleanup.policy": "delete"}
+    )
+
+    recording.fail_on(
+        lambda sql: sql.startswith("INSERT OR REPLACE INTO partition_checkpoint")
+    )
+    with pytest.raises(RehydrateError):
+        await warm.lifecycle.on_partitions_assigned([SOURCE])
+
+
+async def test_rh36_unreached_partition_with_warm_checkpoint_reports_lag(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """A budget-unreached partition that was warmed on a PRIOR run reveals
+    READY_PARTIAL at its persisted checkpoint — ``partition_states()`` must
+    report that checkpoint and its true lag, not "fully unread" (spec §7
+    force-stop; spec §4 live checkpoint_offset).
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, "messages.p1.changelog", 1)
+    await seed_changelog(kafka, "messages.p3.changelog", 5)
+
+    warm = LifecycleHarness(db, kafka)
+    await warm.lifecycle.on_partitions_assigned([P3])  # checkpoint 4
+    await warm.lifecycle.on_partitions_revoked([P3])
+
+    # "Process restart": fresh in-memory state. P1 exhausts the budget, so
+    # P3 is never reached and is revealed at its kept-checkpoint state.
+    clock = MutableClock()
+    harness = LifecycleHarness(
+        db,
+        kafka,
+        rehydrate_timeout=5.0,
+        clock=clock,
+        on_poll=lambda: clock.advance(6.0),
+    )
+    await harness.lifecycle.on_partitions_assigned([P1, P3])
+
+    states = harness.state.partition_states()
+    assert states[P1].state is PartitionStatus.READY
+    assert states[P3].state is PartitionStatus.READY_PARTIAL
+    assert states[P3].checkpoint_offset == 4  # the persisted checkpoint
+    assert states[P3].lag == 0  # 5 - (4+1): caught up, merely unreached
+    assert await owned_rows(db) == {("messages", 1), ("messages", 3)}
+
+
+async def test_rh37_replay_batches_the_checkpoint_upsert(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """Replay advances the checkpoint ONCE per committed batch (spec §7
+    step 3): per-record MAX() upserts are redundant inside the batch
+    transaction — identical end state, N fewer statements per batch. The
+    dedup equivalence (I2/I4) rests on the byte-identical INSERT, which the
+    write and replay paths still share.
+    """
+    from ksqlite.types import PartitionStatus
+
+    kafka = InMemoryKafka()
+    await seed_changelog(kafka, CHANGELOG, 10)
+    recording = RecordingPool(db)
+    harness = LifecycleHarness(db, kafka, pool=recording, batch_size=4)
+
+    await harness.lifecycle.on_partitions_assigned([SOURCE])
+
+    upserts = [
+        sql
+        for sql in recording.executed
+        if sql.startswith("INSERT INTO partition_checkpoint")
+    ]
+    assert len(upserts) == 3  # one per batch (4 + 4 + 2), not one per record
+
+    # The end state is identical to the per-record form (MAX watermark, I3).
+    assert await checkpoint_of(db, SOURCE) == 9
+    assert len(await all_records(db)) == 10
+    assert harness.state.partition_states()[SOURCE].state is PartitionStatus.READY

@@ -59,6 +59,31 @@ def test_fake_producer_rejects_unknown_ctor_kwargs() -> None:
         FakeProducer(InMemoryKafka(), definitely_not_a_real_kwarg=1)  # type: ignore[call-arg]
 
 
+async def test_fake_producer_requires_list_headers() -> None:
+    """Faithful to the real client: aiokafka's (Cython) record-batch builder
+    raises ``TypeError: Expected list, got tuple`` for non-list ``headers``,
+    so the fake must too — otherwise a tuple slips past every fake-backed
+    test and only the real-broker e2e job catches it.
+    """
+    producer = FakeProducer(InMemoryKafka())
+    await producer.start()
+    with pytest.raises(TypeError):
+        # The tuple is the point: pin the runtime rejection the real client
+        # makes, so a non-list can't slip past fake-backed tests.
+        await producer.send_and_wait(
+            "t",
+            value=b"{}",
+            key=b"k",
+            partition=0,
+            headers=(("h", b"v"),),  # type: ignore[arg-type]
+        )
+    # A list is accepted (as is None).
+    await producer.send_and_wait(
+        "t", value=b"{}", key=b"k", partition=0, headers=[("h", b"v")]
+    )
+    await producer.stop()
+
+
 async def test_fake_producer_injectable_failure_and_bad_offset() -> None:
     kafka = InMemoryKafka()
 
@@ -287,7 +312,7 @@ async def test_fake_admin_create_topics_list_topics_and_already_exists() -> None
     admin = FakeAdmin(kafka)
 
     assert await admin.list_topics() == []
-    await admin.create_topics(
+    response = await admin.create_topics(
         [
             NewTopic(
                 "x.changelog",
@@ -297,18 +322,23 @@ async def test_fake_admin_create_topics_list_topics_and_already_exists() -> None
             )
         ]
     )
+    # Pinned against the real client (CF-08): per-topic outcomes are error
+    # codes ON THE RESPONSE — aiokafka's create_topics never raises them.
+    assert [(t, c) for t, c, *_ in response.topic_errors] == [("x.changelog", 0)]
     assert await admin.list_topics() == ["x.changelog"]
     assert kafka.topic_config("x.changelog")["retention.ms"] == "-1"
     assert kafka.topic_partitions("x.changelog") == 1
 
-    with pytest.raises(TopicAlreadyExistsError):
-        await admin.create_topics([NewTopic("x.changelog", 1, 1)])
+    duplicate = await admin.create_topics([NewTopic("x.changelog", 1, 1)])
+    codes = {t: c for t, c, *_ in duplicate.topic_errors}
+    assert codes["x.changelog"] == TopicAlreadyExistsError.errno  # 36, NO raise
 
 
-async def test_fake_admin_injectable_authz_error_and_delete_records() -> None:
+async def test_fake_admin_injectable_failures_and_delete_records() -> None:
+    from aiokafka.admin import NewTopic
     from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
     from aiokafka.admin.records_to_delete import RecordsToDelete
-    from aiokafka.errors import TopicAuthorizationFailedError
+    from aiokafka.errors import KafkaConnectionError, TopicAuthorizationFailedError
 
     from tests.support.fakes import FakeAdmin
 
@@ -316,11 +346,29 @@ async def test_fake_admin_injectable_authz_error_and_delete_records() -> None:
     kafka.create_topic("log", num_partitions=1, configs={})
     await _seed_log(kafka, "log", 5)
 
-    denied = FakeAdmin(
-        kafka, describe_fail_with=TopicAuthorizationFailedError("no ACL")
+    # Connection-level failures RAISE — the real client raises those too.
+    down = FakeAdmin(kafka, describe_fail_with=KafkaConnectionError("down"))
+    with pytest.raises(KafkaConnectionError):
+        await down.describe_configs([ConfigResource(ConfigResourceType.TOPIC, "log")])
+
+    # Broker-reported failures (authorization denials included) come back as
+    # PER-RESOURCE error codes with empty config entries — never as raised
+    # exceptions (pinned against aiokafka's describe_configs).
+    denied = FakeAdmin(kafka, describe_error_code=TopicAuthorizationFailedError.errno)
+    responses = await denied.describe_configs(
+        [ConfigResource(ConfigResourceType.TOPIC, "log")]
     )
-    with pytest.raises(TopicAuthorizationFailedError):
-        await denied.describe_configs([ConfigResource(ConfigResourceType.TOPIC, "log")])
+    (resource,) = responses[0].resources
+    error_code, _msg, _rtype, resource_name, entries = resource
+    assert error_code == TopicAuthorizationFailedError.errno
+    assert resource_name == "log"
+    assert entries == []
+
+    # Per-topic create failures likewise come back as response codes.
+    refused = FakeAdmin(kafka, create_error_code=41)  # NOT_CONTROLLER
+    response = await refused.create_topics([NewTopic("new-topic", 1, 1)])
+    assert [(t, c) for t, c, *_ in response.topic_errors] == [("new-topic", 41)]
+    assert not kafka.topic_exists("new-topic")
 
     admin = FakeAdmin(kafka)
     await admin.delete_records(

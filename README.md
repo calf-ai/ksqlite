@@ -114,9 +114,10 @@ its rebalance listener.
 
 - **Changelog topics** are one per source `(topic, partition)`,
   single-partition, `cleanup.policy=delete` — **never compact** (compaction
-  would collapse an entity to its last message). KSQLite fails fast on a
-  compact changelog at the partition's first assignment; recreate the topic
-  with `cleanup.policy=delete` to remediate.
+  would collapse an entity to its last message). KSQLite checks the policy on
+  a partition's first assignment and logs a loud error if the changelog is
+  compacted, but the assignment still proceeds (topic config is ops' domain);
+  recreate the topic with `cleanup.policy=delete` to remediate.
 - **Retention bounds rehydrate completeness** — a source-of-truth log wants
   long or infinite retention.
 - **Best-effort, not end-to-end crash-durable.** Committed SQLite state

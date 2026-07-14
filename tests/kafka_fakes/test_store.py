@@ -1,4 +1,4 @@
-"""P9 `_store` facade tests: F-01..F-13 (plan §5 P9). Fakes + real SQLite."""
+"""P9 `_store` facade tests: F-01..F-15 (plan §5 P9). Fakes + real SQLite."""
 
 from pathlib import Path
 from typing import Any
@@ -228,7 +228,8 @@ async def test_f03_rollback_on_partial_failure(tmp_path: Path) -> None:
     assert isinstance(exc_info.value.__cause__, KafkaError)
     assert pool.closed
 
-    # (4) admin start fails -> producer stopped AND pool closed.
+    # (4) admin start fails -> the half-started admin is closed too, the
+    # producer stopped AND the pool closed (spec §4: close whatever opened).
     factory = FakeClientFactory(fakes.InMemoryKafka())
     factory.admin_start_error = KafkaError("no broker for admin")
     pool = ProbePool(
@@ -239,8 +240,94 @@ async def test_f03_rollback_on_partial_failure(tmp_path: Path) -> None:
     store = make_store(tmp_path, factory, db_path=tmp_path / "a.db", pool=pool)
     with pytest.raises(KSQLiteError):
         await store.start()
+    assert factory.admins[0].stopped
     assert factory.producers[0].stopped
     assert pool.closed
+
+
+async def test_f03b_rollback_cleanup_failures_are_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cleanup failure during the start() rollback must be logged — never
+    silently suppressed — and must not mask the original startup error or
+    stop the remaining cleanup steps.
+    """
+    import logging
+
+    from aiokafka.errors import KafkaError
+
+    from ksqlite.errors import KSQLiteError
+
+    class ExplodingStopProducer(fakes.FakeProducer):
+        async def stop(self) -> None:
+            raise RuntimeError("stop exploded during rollback")
+
+    class Factory(FakeClientFactory):
+        def producer(self, **kwargs: Any) -> Any:
+            self.producer_kwargs = kwargs
+            producer = ExplodingStopProducer(self.kafka)
+            self.producers.append(producer)
+            return producer
+
+    factory = Factory(fakes.InMemoryKafka())
+    factory.admin_start_error = KafkaError("no broker for admin")
+    pool = ProbePool(
+        __import__("ksqlite")._pool.AiosqlitePoolAdapter(
+            tmp_path / "r.db", pool_size=2, busy_timeout=0.5
+        )
+    )
+    store = make_store(tmp_path, factory, db_path=tmp_path / "r.db", pool=pool)
+
+    with caplog.at_level(logging.WARNING, logger="ksqlite.store"):
+        with pytest.raises(KSQLiteError) as exc_info:
+            await store.start()
+    assert isinstance(exc_info.value.__cause__, KafkaError)  # original kept
+    assert pool.closed  # cleanup continued past the failing step
+    assert any(
+        getattr(r, "event", None) == "start_rollback_close_failed"
+        for r in caplog.records
+    )
+
+
+async def test_f03c_rollback_completes_under_cancellation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A CancelledError hitting one rollback closer must not skip the rest:
+    a skipped pool.close() leaks non-daemon SQLite worker threads that wedge
+    the interpreter at exit (the C-01c hazard). The original startup error
+    still propagates.
+    """
+    import asyncio
+    import logging
+
+    from aiokafka.errors import KafkaError
+
+    from ksqlite.errors import KSQLiteError
+
+    class CancelledStopProducer(fakes.FakeProducer):
+        async def stop(self) -> None:
+            raise asyncio.CancelledError()
+
+    class Factory(FakeClientFactory):
+        def producer(self, **kwargs: Any) -> Any:
+            self.producer_kwargs = kwargs
+            producer = CancelledStopProducer(self.kafka)
+            self.producers.append(producer)
+            return producer
+
+    factory = Factory(fakes.InMemoryKafka())
+    factory.admin_start_error = KafkaError("no broker for admin")
+    pool = ProbePool(
+        __import__("ksqlite")._pool.AiosqlitePoolAdapter(
+            tmp_path / "rc.db", pool_size=2, busy_timeout=0.5
+        )
+    )
+    store = make_store(tmp_path, factory, db_path=tmp_path / "rc.db", pool=pool)
+
+    with caplog.at_level(logging.WARNING, logger="ksqlite.store"):
+        with pytest.raises(KSQLiteError):
+            await store.start()
+    assert pool.closed  # cleanup ran to completion despite the cancellation
 
 
 async def test_f04_double_start(tmp_path: Path) -> None:
@@ -350,6 +437,75 @@ async def test_f06_pre_start_and_post_stop_calls(tmp_path: Path) -> None:
     with pytest.raises(LifecycleError):
         await store.query("SELECT 1")
     await store.stop()  # a second stop() is a NO-OP (pinned)
+
+
+async def test_f14_concurrent_stop_closes_every_client_once(tmp_path: Path) -> None:
+    """Two stop() calls racing while an append drains must not double-close
+    the clients: the STOPPING transition happens synchronously BEFORE the
+    drain await, so the loser of the race is a no-op (spec §4).
+    """
+    import asyncio
+
+    kafka = fakes.InMemoryKafka()
+    kafka.create_topic(
+        CHANGELOG, num_partitions=1, configs={"cleanup.policy": "delete"}
+    )
+    factory = FakeClientFactory(kafka)
+    store = make_store(tmp_path, factory)
+    await store.start()
+    await store.on_partitions_assigned([SOURCE])
+
+    gate = fakes.TwoSidedGate()
+    factory.producers[0].delay_next(gate)
+    append_task = asyncio.create_task(
+        store.append(source=SOURCE, entity_key="k", payload={"i": 1})
+    )
+    await gate.arrived.wait()  # the append is parked in-flight
+
+    stop1 = asyncio.create_task(store.stop())
+    stop2 = asyncio.create_task(store.stop())
+    for _ in range(3):
+        await asyncio.sleep(0)  # both stops reach (or skip) the drain
+    gate.proceed.set()
+    await append_task
+    await stop1
+    await stop2
+
+    assert factory.producers[0].flushed == 1  # closed ONCE, not per stop()
+
+
+async def test_f15_failing_close_step_is_logged_and_rest_still_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """stop() is best-effort: a failing close step is LOGGED (never silently
+    swallowed), every later step still runs, and the FIRST failure is
+    re-raised at the end (spec §4).
+    """
+    import logging
+
+    factory = FakeClientFactory(fakes.InMemoryKafka())
+    inner = __import__("ksqlite")._pool.AiosqlitePoolAdapter(
+        tmp_path / "state.db", pool_size=2, busy_timeout=0.5
+    )
+    pool = ProbePool(inner)
+    store = make_store(tmp_path, factory, pool=pool)
+    await store.start()
+
+    boom = RuntimeError("flush exploded")
+
+    async def failing_flush() -> None:
+        raise boom
+
+    producer = factory.producers[0]
+    producer.flush = failing_flush
+
+    with caplog.at_level(logging.ERROR, logger="ksqlite.store"):
+        with pytest.raises(RuntimeError) as exc_info:
+            await store.stop()
+    assert exc_info.value is boom  # the FIRST failure is re-raised
+    assert producer.stopped  # later steps still ran
+    assert pool.closed
+    assert any(getattr(r, "event", None) == "stop_step_failed" for r in caplog.records)
 
 
 async def test_f07_async_context_manager(tmp_path: Path) -> None:
@@ -525,7 +681,7 @@ async def test_f10_structured_logs_table_driven(
 
     from aiokafka.errors import KafkaError
 
-    from ksqlite.errors import ChangelogProduceError, ConfigError
+    from ksqlite.errors import ChangelogProduceError
 
     caplog.set_level(logging.INFO)
 
@@ -566,7 +722,7 @@ async def test_f10_structured_logs_table_driven(
         await store3.append(source=SOURCE, entity_key="k", payload={})
     await store3.stop()
 
-    # compact_rejected:
+    # compact_policy_detected (best-effort: reported loudly, proceeds):
     compact_kafka = fakes.InMemoryKafka()
     compact_kafka.create_topic(
         CHANGELOG, num_partitions=1, configs={"cleanup.policy": "compact"}
@@ -575,8 +731,7 @@ async def test_f10_structured_logs_table_driven(
         tmp_path, FakeClientFactory(compact_kafka), db_path=tmp_path / "c.db"
     )
     await store4.start()
-    with pytest.raises(ConfigError):
-        await store4.on_partitions_assigned([SOURCE])
+    await store4.on_partitions_assigned([SOURCE])
     await store4.stop()
 
     # truncation_reset + checkpoint_clamped (fully-trimmed tail):
@@ -600,7 +755,7 @@ async def test_f10_structured_logs_table_driven(
         ("ksqlite.schema", "orphaned_index"),
         ("ksqlite.topics", "topic_created"),
         ("ksqlite.topics", "topic_verified"),
-        ("ksqlite.topics", "compact_rejected"),
+        ("ksqlite.topics", "compact_policy_detected"),
         ("ksqlite.write", "append_to_non_ready"),
         ("ksqlite.write", "produce_failure"),
         ("ksqlite.lifecycle", "rehydrate_start"),

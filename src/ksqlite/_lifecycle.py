@@ -1,10 +1,12 @@
 """The PartitionLifecycle service (plan §3 ``_lifecycle``; spec §7/§8).
 
-Owns BOTH rebalance hooks. Grown red-first by RH-01..RH-28. ``batch_size``
-and ``clock`` are real operating parameters with defaults, not test hooks.
+Owns BOTH rebalance hooks. ``batch_size`` and ``clock`` are real operating
+parameters with defaults, not test hooks.
 """
 
+import contextlib
 import logging
+import sqlite3
 import time
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -13,7 +15,7 @@ import aiosqlite
 from aiokafka import TopicPartition
 from aiokafka.errors import KafkaError, OffsetOutOfRangeError
 
-from . import _schema, _wire
+from . import _pool, _schema, _wire
 from ._pool import TransactionRunner
 from ._state import PartitionStateMachine
 from ._topics import ChangelogTopics
@@ -51,10 +53,19 @@ class PartitionLifecycle:
         self._consumer: Any = None
 
     async def _get_consumer(self) -> Any:
-        # Lazily started on the first assignment (spec §4 lifecycle).
+        # Lazily started on the first assignment (spec §4 lifecycle). The
+        # field is assigned only AFTER a successful start(): caching a client
+        # whose start() failed would wedge every later rehydrate (and
+        # aclose() would stop() a never-started consumer).
         if self._consumer is None:
-            self._consumer = self._consumer_factory()
-            await self._consumer.start()
+            consumer = self._consumer_factory()
+            try:
+                await consumer.start()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
+                raise
+            self._consumer = consumer
         return self._consumer
 
     async def aclose(self) -> None:
@@ -70,22 +81,23 @@ class PartitionLifecycle:
         deadline = self._clock() + self._rehydrate_timeout
         first = True
         for tp in assigned:
-            # Step 0 — unconditional on first assignment; budget-EXEMPT
-            # (correctness checks are never force-stopped away).
-            changelog_name = await self._topics.ensure_and_verify(tp)
-            # The deadline is checked before entering each partition AFTER
-            # the first — the first always commits at least one batch.
-            if not first and self._clock() >= deadline:
-                await self._reveal_partial_unreached(tp, changelog_name)
-                continue
-            first = False
             try:
+                # Step 0 — unconditional on first assignment; budget-EXEMPT
+                # (correctness checks are never force-stopped away).
+                changelog_name = await self._topics.ensure_and_verify(tp)
+                # The deadline is checked before entering each partition
+                # AFTER the first — the first partition always gets a full
+                # chance to replay.
+                if not first and self._clock() >= deadline:
+                    await self._reveal_partial_unreached(tp, changelog_name)
+                    continue
+                first = False
                 await self._rehydrate_one(tp, changelog_name, deadline)
             except (StorageError, KafkaError) as exc:
-                # Boundary mapping (spec §4): any mid-replay broker or DB
-                # error is re-raised as RehydrateError with the cause
-                # chained. On any error, partitions not yet revealed in this
-                # assignment stay hidden (RH-28).
+                # Boundary mapping (spec §4): any broker or DB error inside
+                # the assignment hook is re-raised as RehydrateError with the
+                # cause chained. On any error, partitions not yet revealed in
+                # this assignment stay hidden (RH-28).
                 raise RehydrateError(f"rehydrate of {tp} failed: {exc}") from exc
 
     async def on_partitions_revoked(self, revoked: Iterable[TopicPartition]) -> None:
@@ -95,17 +107,21 @@ class PartitionLifecycle:
         for tp in revoked:
             if self._state.status_of(tp) is None:
                 continue  # revoke of a never-owned TP is a no-op (RH-19)
-            async with self._pool.connection() as conn:
-                cursor = await conn.execute(
-                    _schema.OWNED_DELETE_SQL, (tp.topic, tp.partition)
-                )
-                await cursor.close()
+            await self._execute_in_txn(
+                _schema.OWNED_DELETE_SQL, (tp.topic, tp.partition)
+            )
             self._state.mark_revoked(tp)
 
     async def _rehydrate_one(
         self, tp: TopicPartition, changelog_name: str, deadline: float
     ) -> None:
         checkpoint = await self._read_checkpoint(tp)
+        if checkpoint is not None:
+            # Seed the in-memory checkpoint (spec §4: checkpoint_offset is
+            # live): the zero-fetch fast path never reaches record_applied,
+            # so a warm restart would otherwise report checkpoint None /
+            # lag == LEO for a fully caught-up partition (RH-29).
+            self._state.record_applied(tp, checkpoint)
         consumer = await self._get_consumer()
         changelog_tp = TopicPartition(changelog_name, 0)
         leo: int = (await consumer.end_offsets([changelog_tp]))[changelog_tp]
@@ -131,6 +147,7 @@ class PartitionLifecycle:
             position = checkpoint + 1
 
         records_replayed = 0
+        last_applied = checkpoint
         reset_occurred = False
         reset_log_start = 0
         replayed_after_reset = 0
@@ -139,6 +156,13 @@ class PartitionLifecycle:
         # A position ABOVE the LEO (stale-high checkpoint after a log-end
         # regression) still fetches: the broker answers with OOR, which is
         # what routes it into the reset + clamp path (RH-10).
+        #
+        # The deadline is checked on EVERY loop iteration — after a
+        # materialized batch, after an empty fetch, and after an OOR reset.
+        # A fetched batch is ALWAYS materialized + committed before the
+        # check (spec §7); but a degraded broker returning {} forever must
+        # not hold the rebalance callback past rehydrate_timeout — that is
+        # the very rebalance storm the budget exists to prevent (RH-31/32).
         while position != leo:
             try:
                 batch_map = await consumer.getmany(
@@ -168,28 +192,23 @@ class PartitionLifecycle:
                 reset_occurred = True
                 reset_log_start = log_start
                 replayed_after_reset = 0
+                if self._clock() >= deadline:
+                    await self._force_stop(tp, checkpoint=last_applied, leo=leo)
+                    return
                 continue
             records = batch_map.get(changelog_tp, [])
             if not records:
+                if self._clock() >= deadline:
+                    await self._force_stop(tp, checkpoint=last_applied, leo=leo)
+                    return
                 continue
             await self._materialize_batch(tp, records)
             records_replayed += len(records)
             replayed_after_reset += len(records)
             position = records[-1].offset + 1
-            # Deadline check placement (PINNED, plan §3): a fetched batch is
-            # ALWAYS materialized + committed before the check.
+            last_applied = records[-1].offset
             if position != leo and self._clock() >= deadline:
-                self._state.mark_ready_partial(tp)
-                await self._reveal(tp)
-                logger.info(
-                    "rehydrate force-stopped at the replay budget",
-                    extra={
-                        "event": "rehydrate_force_stop",
-                        "tp": tp,
-                        "checkpoint": records[-1].offset,
-                        "log_end_offset": leo,
-                    },
-                )
+                await self._force_stop(tp, checkpoint=last_applied, leo=leo)
                 return
 
         if reset_occurred:
@@ -245,18 +264,31 @@ class PartitionLifecycle:
                         f"{_wire.FORMAT_VERSION!r})"
                     )
                 assert isinstance(decoded, _wire.KsqliteRecord)
-                await _schema.apply_materialization(
+                # The byte-identical INSERT shared with the append path —
+                # that shared statement is what makes replay and write-path
+                # dedup provably equivalent (I2/I4). Replay does NOT run the
+                # per-record checkpoint upsert: one MAX() upsert per
+                # committed batch (below) produces the identical end state
+                # (spec §7 step 3; RH-37).
+                await _pool.execute(
                     conn,
-                    message_id=decoded.message_id,
-                    source_topic=tp.topic,
-                    source_partition=tp.partition,
-                    changelog_offset=record.offset,
-                    entity_key=decoded.entity_key,
-                    payload=decoded.payload,
+                    _schema.INSERT_RECORD_SQL,
+                    {
+                        "message_id": decoded.message_id,
+                        "source_topic": tp.topic,
+                        "source_partition": tp.partition,
+                        "changelog_offset": record.offset,
+                        "entity_key": decoded.entity_key,
+                        "payload": decoded.payload,
+                    },
                 )
-            # Skipped-foreign offsets still advance the checkpoint (spec §7),
-            # so a foreign tail cannot permanently defeat the fast path.
-            cursor = await conn.execute(
+            # ONE checkpoint upsert per committed batch, in the same
+            # transaction as its inserts (both-or-neither, I7). Pinned to the
+            # batch max offset: skipped-foreign offsets still advance the
+            # checkpoint (spec §7), so a foreign tail cannot permanently
+            # defeat the fast path.
+            await _pool.execute(
+                conn,
                 _schema.CHECKPOINT_UPSERT_SQL,
                 {
                     "source_topic": tp.topic,
@@ -264,7 +296,6 @@ class PartitionLifecycle:
                     "changelog_offset": batch_max_offset,
                 },
             )
-            await cursor.close()
 
         async with self._pool.connection() as conn:
             await self._txn_runner.run(conn, work)
@@ -318,14 +349,9 @@ class PartitionLifecycle:
             target = log_start - 1
         if target is None:
             return
-        async with self._pool.connection() as conn:
-            cursor = await conn.execute(
-                "INSERT OR REPLACE INTO partition_checkpoint"
-                "(source_topic, source_partition, changelog_offset)"
-                " VALUES (?, ?, ?)",
-                (tp.topic, tp.partition, target),
-            )
-            await cursor.close()
+        await self._execute_in_txn(
+            _schema.CHECKPOINT_CLAMP_SQL, (tp.topic, tp.partition, target)
+        )
         self._state.record_clamped(tp, target)
         logger.warning(
             "checkpoint of %s clamped from %s to %s after truncation reset",
@@ -341,17 +367,46 @@ class PartitionLifecycle:
         )
 
     async def _reveal(self, tp: TopicPartition) -> None:
+        await self._execute_in_txn(_schema.OWNED_INSERT_SQL, (tp.topic, tp.partition))
+
+    async def _force_stop(
+        self, tp: TopicPartition, *, checkpoint: int | None, leo: int
+    ) -> None:
+        """Reveal the partition READY_PARTIAL at its committed frontier —
+        the §7 force-stop taken whenever the budget expires mid-replay.
+        """
+        self._state.mark_ready_partial(tp)
+        await self._reveal(tp)
+        logger.info(
+            "rehydrate force-stopped at the replay budget",
+            extra={
+                "event": "rehydrate_force_stop",
+                "tp": tp,
+                "checkpoint": checkpoint,
+                "log_end_offset": leo,
+            },
+        )
+
+    async def _execute_in_txn(self, sql: str, params: tuple[Any, ...]) -> None:
+        """One single-statement write through the TransactionRunner: the same
+        bounded SQLITE_BUSY retry and StorageError boundary mapping as every
+        other KSQLite write (spec §4/§11).
+        """
+
+        async def work(conn: aiosqlite.Connection) -> None:
+            await _pool.execute(conn, sql, params)
+
         async with self._pool.connection() as conn:
-            cursor = await conn.execute(
-                _schema.OWNED_INSERT_SQL, (tp.topic, tp.partition)
-            )
-            await cursor.close()
+            await self._txn_runner.run(conn, work)
 
     async def _read_checkpoint(self, tp: TopicPartition) -> int | None:
-        async with self._pool.connection() as conn:
-            cursor = await conn.execute(
-                _schema.SELECT_CHECKPOINT_SQL, (tp.topic, tp.partition)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
+        try:
+            async with self._pool.connection() as conn:
+                row = await _pool.fetch_one(
+                    conn, _schema.SELECT_CHECKPOINT_SQL, (tp.topic, tp.partition)
+                )
+        except sqlite3.Error as exc:
+            # Boundary mapping (spec §4): reads bypass the TransactionRunner
+            # (a SELECT needs no write lock), so the mapping lives here.
+            raise StorageError(f"checkpoint read for {tp} failed: {exc}") from exc
         return None if row is None else int(row[0])

@@ -1,5 +1,5 @@
 """Wire encode/decode + record classification (plan §3 ``_wire``; spec §6,
-§7, §10). Pure module, grown red-first by WF-01..WF-07.
+§7, §10). Pure module.
 """
 
 import json
@@ -96,7 +96,14 @@ def classify(
 
 @dataclass(frozen=True)
 class EncodedRecord:
-    """What ``append`` produces to the changelog (spec §10 wire format)."""
+    """What ``append`` produces to the changelog (spec §10 wire format).
+
+    ``headers`` MUST be a ``list``: aiokafka's producer requires a list (its
+    Cython record-batch builder rejects a tuple with "Expected list, got
+    tuple"), and this object is created and consumed within a single
+    ``append`` and never re-exposed, so there is nothing to protect against
+    external mutation.
+    """
 
     key: bytes
     value: bytes
