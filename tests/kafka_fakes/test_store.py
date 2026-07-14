@@ -1,4 +1,4 @@
-"""P9 `_store` facade tests: F-01..F-13 (plan §5 P9). Fakes + real SQLite."""
+"""P9 `_store` facade tests: F-01..F-15 (plan §5 P9). Fakes + real SQLite."""
 
 from pathlib import Path
 from typing import Any
@@ -287,6 +287,47 @@ async def test_f03b_rollback_cleanup_failures_are_logged(
         getattr(r, "event", None) == "start_rollback_close_failed"
         for r in caplog.records
     )
+
+
+async def test_f03c_rollback_completes_under_cancellation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A CancelledError hitting one rollback closer must not skip the rest:
+    a skipped pool.close() leaks non-daemon SQLite worker threads that wedge
+    the interpreter at exit (the C-01c hazard). The original startup error
+    still propagates.
+    """
+    import asyncio
+    import logging
+
+    from aiokafka.errors import KafkaError
+
+    from ksqlite.errors import KSQLiteError
+
+    class CancelledStopProducer(fakes.FakeProducer):
+        async def stop(self) -> None:
+            raise asyncio.CancelledError()
+
+    class Factory(FakeClientFactory):
+        def producer(self, **kwargs: Any) -> Any:
+            self.producer_kwargs = kwargs
+            producer = CancelledStopProducer(self.kafka)
+            self.producers.append(producer)
+            return producer
+
+    factory = Factory(fakes.InMemoryKafka())
+    factory.admin_start_error = KafkaError("no broker for admin")
+    pool = ProbePool(
+        __import__("ksqlite")._pool.AiosqlitePoolAdapter(
+            tmp_path / "rc.db", pool_size=2, busy_timeout=0.5
+        )
+    )
+    store = make_store(tmp_path, factory, db_path=tmp_path / "rc.db", pool=pool)
+
+    with caplog.at_level(logging.WARNING, logger="ksqlite.store"):
+        with pytest.raises(KSQLiteError):
+            await store.start()
+    assert pool.closed  # cleanup ran to completion despite the cancellation
 
 
 async def test_f04_double_start(tmp_path: Path) -> None:

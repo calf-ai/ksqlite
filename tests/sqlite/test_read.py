@@ -1,4 +1,4 @@
-"""P7 `_read` tests: R-01..R-11 (plan §5 P7). Real tmp-file SQLite."""
+"""P7 `_read` tests: R-01..R-12 (plan §5 P7). Real tmp-file SQLite."""
 
 from ksqlite import _pool, _read
 

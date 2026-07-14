@@ -1,4 +1,4 @@
-"""P8 `_lifecycle` tests: RH-01..RH-28 + T-07 + W-12b (plan §5 P8).
+"""P8 `_lifecycle` tests: RH-01..RH-36 + T-07 + W-12b (plan §5 P8).
 Fakes + real SQLite.
 """
 
@@ -743,8 +743,8 @@ async def test_rh15_assignment_wide_budget_force_stop(
 async def test_rh16_force_stop_is_cooperative_no_rollback(
     db: _pool.AiosqlitePoolAdapter,
 ) -> None:
-    """The deadline is checked BETWEEN batches, never by cancelling a
-    coroutine mid-transaction: no rollback events anywhere (spec §7).
+    """The deadline is checked on every poll iteration, never by cancelling
+    a coroutine mid-transaction: no rollback events anywhere (spec §7).
     """
     _harness, recording, _clock = await _budget_choreography(db)
     assert "rollback" not in recording.events

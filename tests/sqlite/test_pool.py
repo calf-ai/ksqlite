@@ -1,4 +1,4 @@
-"""P3 `_pool` tests: C-01..C-10 (plan §5 P3). Real tmp-file SQLite; never
+"""P3 `_pool` tests: C-01..C-11 (plan §5 P3). Real tmp-file SQLite; never
 ``:memory:`` (WAL and file-lock semantics don't hold there).
 """
 

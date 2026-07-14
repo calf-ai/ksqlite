@@ -261,7 +261,12 @@ class KSQLite:
             for step_name, closer in rollback_steps:
                 try:
                     await closer()
-                except Exception:
+                except BaseException:
+                    # BaseException on purpose (F-03c): a CancelledError
+                    # hitting one closer must not skip the rest — a skipped
+                    # pool.close() leaks non-daemon SQLite worker threads
+                    # (the C-01c hazard). The bare raise below re-raises the
+                    # original startup error.
                     logger.warning(
                         "start() rollback: %s failed",
                         step_name,

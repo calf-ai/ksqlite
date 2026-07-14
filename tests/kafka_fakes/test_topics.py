@@ -1,4 +1,4 @@
-"""P8 `_topics` tests: T-01..T-09 (plan §5 P8). Fakes + real semantics.
+"""P8 `_topics` tests: T-01..T-10 (plan §5 P8). Fakes + real semantics.
 
 T-07 (fast path still runs step 0) lives with the RH suite — it needs the
 lifecycle's assign path.

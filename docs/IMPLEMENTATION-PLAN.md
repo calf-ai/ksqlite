@@ -4,6 +4,13 @@
 > historical; the plan is retained because its test matrix is live — the `W-*`/`RH-*`/`S-*`/
 > `M-*`/`C-*`/`F-*`/`E2E-*`/`CF-*`/`ST-*`/`WF-*`/`T-*` IDs are referenced by docstrings across
 > `tests/` and `src/`.
+>
+> **Post-v1 supersessions:** the 2026-07-14 deep-review fix batch (see
+> `DESIGN-REVIEW-DECISIONS.md`, 2026-07-14 section) changed behaviors that some matrix rows
+> still describe in their original form — T-03, T-05b, T-07, T-08, F-10, E2E-05 (compact policy
+> is now detect-and-proceed, never `ConfigError`), RH-16 (the deadline is now checked on every
+> poll iteration), and the `_topics` module-tree note. For those IDs the test bodies and the
+> decisions log are the source of truth.
 
 Implements `docs/DESIGN.md` (v1 spec, round-5). The spec is the **source of
 truth**; where this plan and the spec disagree, the spec wins and this plan must be corrected — or
