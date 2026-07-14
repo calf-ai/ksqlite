@@ -5,10 +5,13 @@
 import sqlite3
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
 import pytest
+from aiosqlitepool import PoolClosedError, PoolConnectionAcquireTimeoutError
 
 from ksqlite import _pool
 from ksqlite.errors import StorageError
@@ -65,6 +68,57 @@ async def test_c01c_factory_failure_leaks_no_connection_thread(
     with pytest.raises(sqlite3.DatabaseError):
         await _pool.open_connection(garbage, busy_timeout=0.05)
     assert threading.active_count() <= baseline
+
+
+async def test_c01d_non_wal_journal_mode_raises_storage_error() -> None:
+    """``PRAGMA journal_mode=WAL`` does NOT raise on failure — SQLite
+    returns the RESULTING mode (a ``:memory:`` DB stays 'memory'; a network
+    filesystem can stay 'delete'). The uniform read/write pool (Design B,
+    spec §11) is only safe under WAL, so a silent fallback must fail loud —
+    without leaking the half-open connection's worker thread.
+    """
+    baseline = threading.active_count()
+    with pytest.raises(StorageError):
+        conn = await _pool.open_connection(":memory:", busy_timeout=0.5)
+        await conn.close()  # reached only if the WAL check is missing
+    assert threading.active_count() <= baseline
+
+
+@pytest.mark.parametrize(
+    "pool_exc",
+    [PoolConnectionAcquireTimeoutError(), PoolClosedError()],
+    ids=["acquire-timeout", "pool-closed"],
+)
+async def test_c11_pool_layer_failures_map_to_storage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pool_exc: Exception
+) -> None:
+    """aiosqlitepool's failures are plain Exceptions whose ``str()`` is
+    EMPTY (the text lives in ``.message``): unmapped, they'd bypass every
+    ``except StorageError`` a host writes for storage pressure. The adapter
+    maps them to the documented StorageError with the message preserved.
+    """
+    adapter = _pool.AiosqlitePoolAdapter(tmp_path / "c11.db", 1, 0.5)
+
+    class ExhaustedPool:
+        def connection(self) -> AbstractAsyncContextManager[aiosqlite.Connection]:
+            return self._acquire()
+
+        @asynccontextmanager
+        async def _acquire(self) -> AsyncIterator[aiosqlite.Connection]:
+            raise pool_exc
+            yield  # pragma: no cover - never reached
+
+        async def close(self) -> None:
+            pass
+
+    inner = adapter._pool  # noqa: SLF001 - the inner pool is not injectable
+    monkeypatch.setattr(adapter, "_pool", ExhaustedPool())
+    try:
+        with pytest.raises(StorageError, match="pool"):
+            async with adapter.connection():
+                pass
+    finally:
+        await inner.close()
 
 
 async def test_c02_txn_helper_commits(two_conns: ConnPair) -> None:

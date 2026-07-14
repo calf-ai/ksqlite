@@ -55,14 +55,19 @@ async def test_t02_step0_missing_topic_without_autocreate() -> None:
     assert not kafka.topic_exists("messages.p3.changelog")
 
 
-async def test_t03_step0_compact_policy_rejected() -> None:
-    """Compaction would collapse an entity to its last message (spec §10);
-    the value may be `compact,delete`, hence the substring match.
+async def test_t03_step0_compact_policy_detected_and_proceeds(
+    caplog: object,
+) -> None:
+    """Compaction would collapse an entity to its last message (spec §10) —
+    but the policy check is BEST-EFFORT: report loudly (ERROR +
+    ``compact_policy_detected``), never fail the assignment. Ops owns topic
+    config. The value may be `compact,delete`, hence the substring match.
     """
+    import logging
+
     import pytest
 
-    from ksqlite.errors import ConfigError
-
+    assert isinstance(caplog, pytest.LogCaptureFixture)
     for policy in ("compact", "compact,delete"):
         kafka = InMemoryKafka()
         kafka.create_topic(
@@ -71,8 +76,13 @@ async def test_t03_step0_compact_policy_rejected() -> None:
             configs={"cleanup.policy": policy},
         )
         service = make_service(FakeAdmin(kafka))
-        with pytest.raises(ConfigError):
-            await service.ensure_and_verify(SOURCE)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ksqlite.topics"):
+            name = await service.ensure_and_verify(SOURCE)  # NO raise
+        assert name == "messages.p3.changelog"
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "compact_policy_detected" in events
+        assert "topic_verified" not in events  # detected != verified
 
     kafka = InMemoryKafka()
     kafka.create_topic(
@@ -80,7 +90,7 @@ async def test_t03_step0_compact_policy_rejected() -> None:
         num_partitions=1,
         configs={"cleanup.policy": "delete"},
     )
-    await make_service(FakeAdmin(kafka)).ensure_and_verify(SOURCE)  # passes
+    await make_service(FakeAdmin(kafka)).ensure_and_verify(SOURCE)  # verifies
 
 
 def _acl_denied_service() -> tuple[FakeAdmin, "_topics.ChangelogTopics"]:
@@ -92,7 +102,9 @@ def _acl_denied_service() -> tuple[FakeAdmin, "_topics.ChangelogTopics"]:
         num_partitions=1,
         configs={"cleanup.policy": "compact"},  # unverifiable without the ACL
     )
-    admin = FakeAdmin(kafka, describe_fail_with=TopicAuthorizationFailedError("no ACL"))
+    # A missing DESCRIBE_CONFIGS ACL surfaces as a PER-RESOURCE error code —
+    # aiokafka's describe_configs never raises it (verified against 0.14).
+    admin = FakeAdmin(kafka, describe_error_code=TopicAuthorizationFailedError.errno)
     return admin, make_service(admin)
 
 
@@ -145,11 +157,12 @@ async def test_t05_success_cached_per_tp() -> None:
     assert admin.describe_calls == 1  # no re-verify
 
 
-async def test_t05b_cache_is_per_tp_not_global() -> None:
+async def test_t05b_cache_is_per_tp_not_global(caplog: object) -> None:
+    import logging
+
     import pytest
 
-    from ksqlite.errors import ConfigError
-
+    assert isinstance(caplog, pytest.LogCaptureFixture)
     kafka = InMemoryKafka()
     kafka.create_topic(
         "messages.p0.changelog", num_partitions=1, configs={"cleanup.policy": "delete"}
@@ -163,8 +176,12 @@ async def test_t05b_cache_is_per_tp_not_global() -> None:
 
     await service.ensure_and_verify(TopicPartition("messages", 0))  # verified
 
-    with pytest.raises(ConfigError):  # (messages,1) must still be checked
+    with caplog.at_level(logging.ERROR, logger="ksqlite.topics"):
         await service.ensure_and_verify(TopicPartition("messages", 1))
+    # (messages,1) was still checked: its compact policy is detected.
+    assert any(
+        getattr(r, "event", None) == "compact_policy_detected" for r in caplog.records
+    )
 
 
 async def test_t06_verify_false_skips_describe() -> None:
@@ -182,28 +199,45 @@ async def test_t06_verify_false_skips_describe() -> None:
 
 
 async def test_t08_failure_not_cached() -> None:
+    """A step-0 failure — here a broker-reported create failure, surfaced as
+    a per-topic RESPONSE error code (aiokafka never raises those) — raises
+    RehydrateError and is NOT cached: the next assignment retries (spec §7).
+    """
     import pytest
 
-    from ksqlite.errors import ConfigError
+    from ksqlite.errors import RehydrateError
 
     kafka = InMemoryKafka()
-    kafka.create_topic(
-        "messages.p3.changelog",
-        num_partitions=1,
-        configs={"cleanup.policy": "compact"},
-    )
-    service = make_service(FakeAdmin(kafka))
+    admin = FakeAdmin(kafka, create_error_code=41)  # NOT_CONTROLLER
+    service = make_service(admin, create_topics_retention_ms=-1)
 
-    with pytest.raises(ConfigError):
+    with pytest.raises(RehydrateError):
         await service.ensure_and_verify(SOURCE)
+    assert not kafka.topic_exists("messages.p3.changelog")
 
-    # Ops fixes the policy; the next assignment re-verifies and succeeds.
-    kafka.create_topic(
-        "messages.p3.changelog",
-        num_partitions=1,
-        configs={"cleanup.policy": "delete"},
+    # The broker recovers; the next assignment re-runs step 0 and succeeds.
+    admin._create_error_code = None  # noqa: SLF001
+    name = await service.ensure_and_verify(SOURCE)
+    assert kafka.topic_exists(name)
+    assert admin.create_calls == 2
+
+
+async def test_t10_concurrent_create_race_counts_as_success() -> None:
+    """Losing a create race surfaces as error code 36 on the RESPONSE (the
+    real client never raises it) — success, not a failure (spec §7 step 0).
+    """
+    from aiokafka.errors import TopicAlreadyExistsError
+
+    kafka = InMemoryKafka()
+    admin = FakeAdmin(kafka, create_error_code=TopicAlreadyExistsError.errno)
+    service = make_service(
+        admin, create_topics_retention_ms=-1, verify_changelog_policy=False
     )
-    await service.ensure_and_verify(SOURCE)
+
+    name = await service.ensure_and_verify(SOURCE)  # NO raise
+    assert name == "messages.p3.changelog"
+    await service.ensure_and_verify(SOURCE)  # cached as success
+    assert admin.create_calls == 1
 
 
 async def test_t09_resolution_time_name_validation() -> None:

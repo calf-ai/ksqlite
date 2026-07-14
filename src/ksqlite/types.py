@@ -1,8 +1,4 @@
-"""Public types and injection-seam protocols (spec §4 "Types"). Leaf module.
-
-Remaining placeholder names from L-01 (export surface) are grown red-first by
-L-03/L-04.
-"""
+"""Public types and injection-seam protocols (spec §4 "Types"). Leaf module."""
 
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -28,11 +24,19 @@ class GeneratedColumn:
 
 @dataclass(frozen=True)
 class Index:
-    """Host-declared index over system, base, or generated columns."""
+    """Host-declared index over system, base, or generated columns.
+
+    ``columns`` is snapshotted to a tuple at construction: frozen means
+    frozen — mutating the sequence the caller passed must not change the
+    emitted DDL.
+    """
 
     name: str
     columns: Sequence[str]
     unique: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "columns", tuple(self.columns))
 
 
 class PartitionStatus(Enum):
@@ -83,7 +87,9 @@ class KafkaClientFactory(Protocol):
     Contract: the three methods are synchronous, receive the fully-merged
     final kwargs (defaults ← user config ← the pinned consumer keys — merged
     by KSQLite, never by the factory), and return constructed-but-unstarted
-    clients; KSQLite owns ``start()``/``stop()``.
+    clients. KSQLite owns each client's lifecycle: ``start()`` on all three,
+    ``stop()`` on the producer and consumer (plus ``flush()`` on the
+    producer), and ``close()`` on the admin client.
     """
 
     def producer(self, **kwargs: Any) -> Any:

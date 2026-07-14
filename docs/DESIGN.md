@@ -89,7 +89,7 @@ store = KSQLite(
     bootstrap_servers="localhost:9092",
     changelog_topic_template="{source_topic}.p{partition}.changelog",
     create_topics_retention_ms=None,         # None = don't create; int retention (-1 = infinite) auto-creates missing changelog topics (dev)
-    verify_changelog_policy=True,            # fail-fast (on a partition's first assignment) if its changelog is cleanup.policy=compact
+    verify_changelog_policy=True,            # best-effort check (on a partition's first assignment): a compact changelog is reported loudly, never fails the assignment
     generated_columns=[GeneratedColumn("task_id", "$.task_id"),
                        GeneratedColumn("thread_id", "$.thread_id")],
     indexes=[Index("ix_thread", ["thread_id"])],
@@ -162,8 +162,8 @@ clients; KSQLite owns `start()`/`stop()`. Both seams exist for testing/injection
 alternative to monkeypatching — not as advertised extension points. `PartitionState` is a frozen
 dataclass; its `state` field is an exported `PartitionStatus` enum.
 
-**Error taxonomy.** `KSQLiteError` (base) → `ConfigError` (bad config / DDL drift / compact changelog
-policy), `SQLiteVersionError` (SQLite < 3.38 at start), `SchemaMigrationError` (an `ALTER
+**Error taxonomy.** `KSQLiteError` (base) → `ConfigError` (bad config / DDL
+drift), `SQLiteVersionError` (SQLite < 3.38 at start), `SchemaMigrationError` (an `ALTER
 TABLE`/`CREATE INDEX` execution failure during migration), `ChangelogProduceError` (produce failure or
 `offset < 0`), `TopicNotFoundError` (a changelog topic is missing on its partition's first assignment
 and `create_topics_retention_ms` is `None` — raised from `on_partitions_assigned`, §7 step 0),
@@ -208,7 +208,7 @@ completion signaled by an `asyncio.Event` (no polling). The drain covers **appen
 close step is attempted and the first exception re-raised at the end; a second `stop()` is a no-op.
 
 **Observability.** Structured logs on: rehydrate start / end / force-stop, topic ensure/verify, produce
-failure, schema migration (`ALTER`/`CREATE INDEX`), compact-policy rejection, appends to a
+failure, schema migration (`ALTER`/`CREATE INDEX`), compact-policy detection, appends to a
 non-READY partition (§6), foreign-record skips (§7), orphaned column/index on config removal (§5.1),
 and — WARNING level, data-loss-adjacent and operator-actionable — the **truncation reset**
 (offset-out-of-range recovery) and **checkpoint clamps** (§7).
@@ -339,8 +339,14 @@ tiny (this process's partitions), indexed by its PK; the 4-valued partition stat
   `busy_timeout` + a bounded retry (§11) handle contention. No app-level writer lock.
 - `append` to a partition that is **not READY** in the state machine is a **host-contract violation**
   (the §4 handshake runs assign-rehydrate before the host processes messages). KSQLite **logs a
-  warning** rather than raising — the write itself still converges (new offsets extend the log;
-  `message_id` dedup keeps an in-flight replay idempotent) — but hosts must not rely on it.
+  warning** rather than raising — but hosts must not rely on it. Convergence is guaranteed only for
+  the **sole current owner** of the partition: within one process, new offsets extend the log and
+  `message_id` dedup keeps an in-flight replay idempotent. Across a rebalance there is **no producer
+  fencing** (the changelog producer is the host's own; the rehydrate consumer never joins a group),
+  so a previous owner's post-revoke append lands in the changelog *after* the new owner has already
+  rehydrated to the captured LEO — the new owner will not observe that record until its next
+  rehydrate of the partition, which under a stable assignment may be never. Hosts must stop
+  appending for a partition once its revoke hook has run.
 
 ---
 
@@ -353,11 +359,17 @@ partition, in order:
    the replay budget** (correctness checks are never force-stopped away; only replay is). Resolve the
    name from the template + assignment context (validated as a legal Kafka topic name at resolution).
    If the topic is missing: create it when `create_topics_retention_ms` is set (single-partition,
-   `cleanup.policy=delete`, that retention; a concurrent-create `TopicAlreadyExists` counts as
-   success), else raise **`TopicNotFoundError`**. If `verify_changelog_policy`, run `describe_configs`
-   and raise `ConfigError` when `cleanup.policy` contains `compact` (§10); on a missing
-   `DESCRIBE_CONFIGS` ACL, log a warning and proceed. Caching: **success and the warn+proceed outcome
-   are cached per TP for the store's lifetime** (warn once; a fresh store re-checks); a **failed**
+   `cleanup.policy=delete`, that retention). Per-topic create outcomes come back as **error codes on
+   the `create_topics` response** (aiokafka never raises them): the `TopicAlreadyExists` code counts
+   as success (a concurrent creator won the race); any other non-zero code fails step 0 loudly. When
+   the topic is missing and `create_topics_retention_ms` is `None`, raise **`TopicNotFoundError`**.
+   If `verify_changelog_policy`, run `describe_configs` and walk the per-resource error codes and
+   config entries: the check is **best-effort** — a `cleanup.policy` containing `compact` is reported
+   loudly (ERROR, `compact_policy_detected`) and the assignment **proceeds** (§10); a non-zero
+   resource error code (authorization denials included — they arrive as codes, not raised
+   exceptions) means "could not verify": log a warning and proceed, never claim verified. Caching:
+   **success and the warn/detect+proceed outcomes are cached per TP for the store's lifetime** (warn
+   once; a fresh store re-checks); a **failed**
    ensure/verify is NOT cached and re-runs on the partition's next assignment. Any other broker
    failure here (describe/create timeout, connection loss) raises **`RehydrateError`**.
    **Fast path (after step 0):** if the local checkpoint is already at the changelog log-end
@@ -414,9 +426,12 @@ partition, in order:
   for the entire `on_partitions_assigned` callback**, shared across all its partitions — a
   *per-partition* budget would multiply by the assignment size (e.g. 8 partitions × 30 s ≫
   `max.poll.interval.ms`) and trigger the very rebalance storm it exists to prevent. The deadline is
-  checked **between batches**, never by cancelling a coroutine mid-transaction (an async cancel inside
+  checked **on every poll iteration** — after each materialized batch, after an empty fetch, and
+  after a truncation reset (a degraded broker returning `{}` forever must not hold the callback past
+  the budget) — never by cancelling a coroutine mid-transaction (an async cancel inside
   `BEGIN IMMEDIATE` could return a connection to the pool still holding the write lock — see the
-  connection-hygiene rules in §11). On expiry: stop, keep the checkpoint at the last materialized
+  connection-hygiene rules in §11). A fetched batch is always materialized + committed before the
+  check. On expiry: stop, keep the checkpoint at the last materialized
   offset, **log**, mark **`READY_PARTIAL`** (in-memory) and `INSERT` the `_owned` row (partial rows
   become visible); partitions the budget never reached are revealed the same way at their
   kept-checkpoint state. There is **no forward-progress guarantee within a single assignment** — the
@@ -479,10 +494,13 @@ the instant its row is deleted (never stale).
 - **`cleanup.policy=delete`, NEVER `compact`** — compaction would collapse an entity to its last
   message. On the **first assignment of each `(topic,partition)`** (when `verify_changelog_policy`;
   §7 step 0 — changelog names are unknowable at `start()`), read the topic's policy via the admin
-  client's `describe_configs` — walk the response's `.resources` config entries and substring-match
-  `compact` (the value may be `compact,delete`) — and **raise `ConfigError` on `compact`**. If the describe call fails on
-  **authorization** (missing `DESCRIBE_CONFIGS` ACL), **log a warning and proceed** ("could not verify"
-  ≠ "policy is wrong") — full enforcement requires the ACL. **Remediation is documented:** the policy is
+  client's `describe_configs` — walk the response's `.resources` entries: check each resource's
+  **error code first** (aiokafka reports failures, authorization denials included, as per-resource
+  codes with empty config entries — it never raises them), then substring-match `compact` in
+  `cleanup.policy` (the value may be `compact,delete`). The check is **best-effort** — topic config
+  is ops' domain: a compact policy is **reported loudly (ERROR, `compact_policy_detected`) and the
+  assignment proceeds**; a non-zero resource error code means "could not verify" (warn + proceed,
+  never claim verified). **Remediation is documented:** the policy is
   a dynamic config —
   `kafka-configs.sh --alter --entity-type topics --entity-name <t> --add-config cleanup.policy=delete`
   (aiokafka: `AIOKafkaAdminClient.alter_configs`, which replaces the topic's full config set; the Java
@@ -581,12 +599,12 @@ fallback path — the generated-column DDL emits `->>` and the floor is 3.38.)
 | `bootstrap_servers` | — | Kafka bootstrap. |
 | `changelog_topic_template` | `{source_topic}.p{partition}.changelog` | must contain `{source_topic}` **and** `{partition}`. |
 | `create_topics_retention_ms` | `None` | `None` = don't create; an int retention (`-1` = infinite) auto-creates a missing single-partition delete-policy changelog topic on its partition's first assignment. |
-| `verify_changelog_policy` | `True` | fail-fast on a partition's first assignment if its changelog is `cleanup.policy=compact` (warn+proceed on missing ACL). |
+| `verify_changelog_policy` | `True` | best-effort check on a partition's first assignment: a compact changelog is reported loudly (`compact_policy_detected`) and the assignment proceeds; an unverifiable one (e.g. missing ACL) warns and proceeds. |
 | `generated_columns` / `indexes` | `()` | host-declared queryable columns (VIRTUAL, `->>`) + indexes. |
 | `pool_size` | `16` | uniform pool size (`≥ 1`). |
 | `busy_timeout` | `5.0` | SQLite busy-handler wait, seconds (`> 0`). |
-| `rehydrate_timeout` | `30.0` | total replay budget per rebalance callback (cooperative, checked between batches); keep `< max.poll.interval.ms` (`> 0`). |
-| `producer_config` / `consumer_config` | `{"acks":1}` / `{}` | pass-through over defaults; `acks` must be `≥ 1`. |
+| `rehydrate_timeout` | `30.0` | total replay budget per rebalance callback (cooperative, checked on every poll iteration); keep `< max.poll.interval.ms` (`> 0`). |
+| `producer_config` / `consumer_config` | `None` / `None` | pass-through, merged over defaults at `start()` (effective producer default `acks=1` — applied even when the mapping omits it); `acks` must be `≥ 1`. |
 
 ## 16. Deployment & testing
 - One SQLite DB per process; WAL sidecar files (`-wal`/`-shm`) next to it.
@@ -602,7 +620,7 @@ fallback path — the generated-column DDL emits `->>` and the floor is 3.38.)
   retry → `StorageError`; `entity_key` validation (+ bad-key/foreign-record skip on replay);
   `message_id` idempotency (retry + re-read); generated-column migration idempotency (**`table_xinfo`**
   diff) + drift fail-fast (canonical re-rendered DDL) + index drift; `_owned` cleared on `start()`;
-  lazy topic ensure/verify on first assignment (`TopicNotFoundError`, compact `ConfigError`,
+  lazy topic ensure/verify on first assignment (`TopicNotFoundError`, compact detect+proceed,
   ACL warn+proceed); rehydrate (full, incremental, keep-on-revoke, assignment-wide budget
   force-stop→`READY_PARTIAL`, truncated-log reset + checkpoint clamp, `entity_key`-from-key
   reconstruction, unknown-`format_version` fail-loud, **no write lock held across a `poll()`**, no

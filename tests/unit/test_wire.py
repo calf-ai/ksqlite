@@ -1,6 +1,7 @@
 """P5 `_wire` tests: WF-01..WF-07 (plan §5 P5). Pure; no I/O."""
 
 import json
+from collections.abc import Sequence
 
 import pytest
 
@@ -16,11 +17,12 @@ def test_wf01_encode() -> None:
     assert isinstance(record.value, bytes)
     assert json.loads(record.value.decode("utf-8")) == {"a": 1}
     # Header keys are str, values bytes (aiokafka carries only bytes; the
-    # fakes and CF-05 pin the same shape).
-    assert record.headers == [
+    # fakes and CF-05 pin the same shape). Snapshotted to a tuple: frozen
+    # means frozen.
+    assert record.headers == (
         ("format_version", b"1"),
         ("message_id", MID.encode("utf-8")),
-    ]
+    )
 
     unicode_record = _wire.encode(entity_key="tâsk-🚀", payload={}, message_id=MID)
     assert unicode_record.key == "tâsk-🚀".encode()
@@ -43,7 +45,7 @@ def test_wf03_classification_foreign() -> None:
     """
     good = _wire.encode(entity_key="k", payload={}, message_id=MID)
 
-    cases: list[tuple[str, bytes | None, bytes | None, list[tuple[str, bytes]]]] = [
+    cases: list[tuple[str, bytes | None, bytes | None, Sequence[tuple[str, bytes]]]] = [
         ("no headers at all", good.key, good.value, []),
         (
             "message_id decodes but is not a UUID",

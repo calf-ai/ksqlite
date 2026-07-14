@@ -6,7 +6,7 @@ class KSQLiteError(Exception):
 
 
 class ConfigError(KSQLiteError):
-    """Bad configuration, DDL drift, or a compact changelog policy."""
+    """Bad configuration or DDL drift."""
 
 
 class SQLiteVersionError(KSQLiteError):

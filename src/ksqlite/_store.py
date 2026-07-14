@@ -1,15 +1,16 @@
 """KSQLite facade — pure composition root + delegation (plan §3 ``_store``;
-spec §4). No business logic lives here. Grown red-first by F-01..F-13.
+spec §4). No business logic lives here.
 """
 
 import asyncio
-import contextlib
+import enum
 import inspect
+import logging
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, TypeVar, overload
 
 from aiokafka import TopicPartition
 
@@ -21,9 +22,33 @@ from .errors import (
     SchemaMigrationError,
     StorageError,
 )
-from .types import GeneratedColumn, Index, PartitionState
+from .types import (
+    ConnectionPool,
+    GeneratedColumn,
+    Index,
+    KafkaClientFactory,
+    PartitionState,
+)
+
+logger = logging.getLogger("ksqlite.store")
+
+T = TypeVar("T")
 
 DEFAULT_CHANGELOG_TEMPLATE = "{source_topic}.p{partition}.changelog"
+
+
+class _RunState(enum.Enum):
+    """The facade's lifecycle phase — a single enum, so only the four legal
+    states are representable (spec §4): ``stop()`` transitions RUNNING →
+    STOPPING synchronously (closing the concurrent-stop window, F-14), then
+    STOPPING → CLOSED once the append drain completes.
+    """
+
+    NEW = "NEW"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    CLOSED = "CLOSED"
+
 
 # The three non-overridable rehydrate-consumer keys (spec §7 step 2). The
 # first two because a manual-assign consumer must never join or commit into
@@ -121,8 +146,8 @@ class KSQLite:
         rehydrate_timeout: float = 30.0,
         producer_config: Mapping[str, Any] | None = None,
         consumer_config: Mapping[str, Any] | None = None,
-        kafka_clients: Any = None,
-        pool: Any = None,
+        kafka_clients: KafkaClientFactory | None = None,
+        pool: ConnectionPool | None = None,
     ) -> None:
         self._db_path = db_path
         self._bootstrap_servers = bootstrap_servers
@@ -136,13 +161,11 @@ class KSQLite:
         self._rehydrate_timeout = rehydrate_timeout
         self._producer_config = dict(producer_config or {})
         self._consumer_config = dict(consumer_config or {})
-        self._factory = kafka_clients or _AiokafkaClientFactory()
+        self._factory: KafkaClientFactory = kafka_clients or _AiokafkaClientFactory()
         self._injected_pool = pool
 
         self._state = _state.PartitionStateMachine()
-        self._started = False
-        self._stopping = False
-        self._closed = False
+        self._run_state = _RunState.NEW
         self._in_flight = 0
         self._drained = asyncio.Event()
 
@@ -181,7 +204,7 @@ class KSQLite:
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
-        if self._started or self._closed:
+        if self._run_state is not _RunState.NEW:
             raise LifecycleError("start() called twice (or after stop())")
         # Fail-fast BEFORE any I/O: no pool open, no broker connect (F-01).
         self._validate_config()
@@ -189,6 +212,7 @@ class KSQLite:
 
         pool: Any = None
         producer: Any = None
+        admin: Any = None
         try:
             pool = self._injected_pool or _pool.AiosqlitePoolAdapter(
                 self._db_path, self._pool_size, self._busy_timeout
@@ -223,13 +247,30 @@ class KSQLite:
             except Exception as exc:
                 raise KSQLiteError(f"admin client failed to start: {exc}") from exc
         except BaseException:
-            # Rollback-on-partial-failure (spec §4): close whatever opened.
+            # Rollback-on-partial-failure (spec §4): close whatever opened,
+            # in reverse open order. Cleanup failures are LOGGED and
+            # suppressed — they must never mask the original startup error
+            # (F-03/F-03b).
+            rollback_steps: list[tuple[str, Any]] = []
+            if admin is not None:
+                rollback_steps.append(("admin.close", admin.close))
             if producer is not None:
-                with contextlib.suppress(Exception):
-                    await producer.stop()
+                rollback_steps.append(("producer.stop", producer.stop))
             if pool is not None:
-                with contextlib.suppress(Exception):
-                    await pool.close()
+                rollback_steps.append(("pool.close", pool.close))
+            for step_name, closer in rollback_steps:
+                try:
+                    await closer()
+                except Exception:
+                    logger.warning(
+                        "start() rollback: %s failed",
+                        step_name,
+                        exc_info=True,
+                        extra={
+                            "event": "start_rollback_close_failed",
+                            "step": step_name,
+                        },
+                    )
             raise
 
         # Composition root: construct the four services (plan §3 _store).
@@ -264,34 +305,46 @@ class KSQLite:
             txn_runner=txn_runner,
             rehydrate_timeout=self._rehydrate_timeout,
         )
-        self._started = True
+        self._run_state = _RunState.RUNNING
 
     async def stop(self) -> None:
-        if self._closed:
-            return  # a second stop() is a no-op (spec §4, pinned)
-        if not self._started:
+        if self._run_state in (_RunState.STOPPING, _RunState.CLOSED):
+            # A second stop() — or one racing an in-flight stop() — is a
+            # no-op (spec §4, pinned); the winner runs the close sequence.
+            return
+        if self._run_state is _RunState.NEW:
             raise LifecycleError("stop() before start()")
+        # The STOPPING transition is synchronous — no await between the
+        # guard above and this write — so a concurrent stop() cannot also
+        # pass the guard and double-close the clients (F-14).
+        self._run_state = _RunState.STOPPING
         # Happy-path drain, appends only (spec §4, pinned mechanics).
-        self._stopping = True
         if self._in_flight > 0:
             await self._drained.wait()
-        self._closed = True
+        self._run_state = _RunState.CLOSED
 
-        # Best-effort: every close step is attempted; the first exception is
-        # re-raised at the end (spec §4).
+        # Best-effort: every close step is attempted; each failure is LOGGED
+        # (a swallowed pool.close() failure hides wedged worker threads); the
+        # FIRST exception is re-raised at the end (spec §4).
         first_exc: BaseException | None = None
         assert self._lifecycle is not None
-        steps = (
-            self._producer.flush,
-            self._producer.stop,
-            self._lifecycle.aclose,
-            self._admin.close,
-            self._pool.close,
+        steps: tuple[tuple[str, Any], ...] = (
+            ("producer.flush", self._producer.flush),
+            ("producer.stop", self._producer.stop),
+            ("consumer.stop", self._lifecycle.aclose),
+            ("admin.close", self._admin.close),
+            ("pool.close", self._pool.close),
         )
-        for step in steps:
+        for step_name, step in steps:
             try:
                 await step()
             except BaseException as exc:
+                logger.error(
+                    "stop(): close step %s failed",
+                    step_name,
+                    exc_info=exc,
+                    extra={"event": "stop_step_failed", "step": step_name},
+                )
                 if first_exc is None:
                     first_exc = exc
         if first_exc is not None:
@@ -310,7 +363,7 @@ class KSQLite:
         await self.stop()
 
     def _ensure_running(self) -> None:
-        if not self._started or self._stopping or self._closed:
+        if self._run_state is not _RunState.RUNNING:
             raise LifecycleError(
                 "KSQLite is not running: call start() first, and not after stop()"
             )
@@ -320,7 +373,7 @@ class KSQLite:
     async def append(
         self, *, source: TopicPartition, entity_key: str, payload: object
     ) -> None:
-        # PINNED drain mechanics (spec §4): the closed-flag check and the
+        # PINNED drain mechanics (spec §4): the running-state check and the
         # in-flight increment are synchronous — no await between them.
         self._ensure_running()
         self._in_flight += 1
@@ -331,8 +384,26 @@ class KSQLite:
             )
         finally:
             self._in_flight -= 1
-            if self._stopping and self._in_flight == 0:
+            if self._run_state is not _RunState.RUNNING and self._in_flight == 0:
                 self._drained.set()
+
+    @overload
+    async def query(
+        self,
+        sql: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+        *,
+        into: None = None,
+    ) -> list[sqlite3.Row]: ...
+
+    @overload
+    async def query(
+        self,
+        sql: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+        *,
+        into: type[T],
+    ) -> list[T]: ...
 
     async def query(
         self,

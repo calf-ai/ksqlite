@@ -1,5 +1,10 @@
 # KSQLite — v1 Implementation Plan (round-3)
 
+> **Status: shipped as v1 (0.1.0, PR #1).** The phase-gate build instructions below are
+> historical; the plan is retained because its test matrix is live — the `W-*`/`RH-*`/`S-*`/
+> `M-*`/`C-*`/`F-*`/`E2E-*`/`CF-*`/`ST-*`/`WF-*`/`T-*` IDs are referenced by docstrings across
+> `tests/` and `src/`.
+
 Implements `docs/DESIGN.md` (v1 spec, round-5). The spec is the **source of
 truth**; where this plan and the spec disagree, the spec wins and this plan must be corrected — or
 the spec is amended via `docs/DESIGN-REVIEW-DECISIONS.md`, never silently. This revision folds in the

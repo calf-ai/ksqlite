@@ -209,3 +209,17 @@ async def test_r10_direct_read_of_internals_is_allowed(
     runner = _read.QueryRunner(pool=db)
     assert await runner.query("SELECT * FROM records") == []
     assert len(await runner.query("SELECT * FROM _records")) == 1
+
+
+async def test_r12_query_resets_row_factory_on_the_pooled_connection(
+    db: _pool.AiosqlitePoolAdapter,
+) -> None:
+    """``query()`` sets sqlite3.Row for its own fetch; the pooled connection
+    must come back clean — a leaked row_factory is cross-checkout state that
+    every later (non-query) user silently inherits (spec §11 hygiene).
+    """
+    runner = _read.QueryRunner(pool=db)
+    await runner.query("SELECT 1")
+
+    async with db.connection() as conn:
+        assert conn.row_factory is None

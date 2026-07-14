@@ -63,6 +63,17 @@ def test_s07_template_and_topic_name_validation() -> None:
     _sql.validate_topic_name("a-b_c.9")
     _sql.validate_topic_name("x" * 249)  # boundary: exactly the Kafka limit
 
+    # A template that cannot format with exactly {source_topic}/{partition}
+    # must fail HERE as ConfigError — not as a raw KeyError/ValueError from
+    # the first rebalance callback (F-01 fail-fast).
+    for unformattable in (
+        "{source_topic}.p{partition}.{env}",  # unknown placeholder
+        "{source_topic}.p{partition}{",  # malformed braces
+        "{source_topic}.p{partition}.{}",  # positional field
+    ):
+        with pytest.raises(ConfigError):
+            _sql.validate_changelog_template(unformattable)
+
     for bad_name in ("", "bad topic!", "café", ".", "..", "x" * 250):
         with pytest.raises(ConfigError):
             _sql.validate_topic_name(bad_name)

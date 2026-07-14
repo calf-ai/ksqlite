@@ -1,7 +1,7 @@
 """Schema migration + drift detection (plan §3 ``_schema``; spec §5.1, §12).
 
-Also the single home of shared DML (the materialization pair and the three
-``_owned`` statements) once P6/P8 drive them. Grown red-first by M-01..M-12.
+Also the single home of shared DML: the materialization pair, the
+checkpoint clamp, and the three ``_owned`` statements.
 """
 
 import logging
@@ -11,7 +11,7 @@ from collections.abc import Sequence
 
 import aiosqlite
 
-from . import _sql
+from . import _pool, _sql
 from .errors import ConfigError, SchemaMigrationError, SQLiteVersionError
 from .types import GeneratedColumn, Index
 
@@ -91,6 +91,15 @@ INSERT INTO partition_checkpoint(source_topic, source_partition, changelog_offse
   ON CONFLICT(source_topic, source_partition)
   DO UPDATE SET changelog_offset = MAX(changelog_offset, excluded.changelog_offset)"""
 
+# The §7 step-2 clamp — the ONLY non-monotonic checkpoint write. It
+# deliberately overrides the MAX() upsert above: after a truncation reset
+# the checkpoint must be able to move DOWN.
+CHECKPOINT_CLAMP_SQL = (
+    "INSERT OR REPLACE INTO partition_checkpoint"
+    "(source_topic, source_partition, changelog_offset)"
+    " VALUES (?, ?, ?)"
+)
+
 
 # The three _owned statements (spec §5.3) — presence-only visibility rows.
 OWNED_INSERT_SQL = (
@@ -124,16 +133,10 @@ async def apply_materialization(
         "entity_key": entity_key,
         "payload": payload,
     }
-    cursor = await conn.execute(INSERT_RECORD_SQL, params)
-    await cursor.close()
-    cursor = await conn.execute(
-        CHECKPOINT_UPSERT_SQL,
-        {
-            k: params[k]
-            for k in ("source_topic", "source_partition", "changelog_offset")
-        },
-    )
-    await cursor.close()
+    await _pool.execute(conn, INSERT_RECORD_SQL, params)
+    # sqlite3 ignores named-parameter keys a statement does not reference
+    # (verified empirically), so the same dict feeds both statements.
+    await _pool.execute(conn, CHECKPOINT_UPSERT_SQL, params)
 
 
 async def migrate(
@@ -143,25 +146,20 @@ async def migrate(
 ) -> None:
     """Idempotent schema migration at ``start()`` (spec §5.1)."""
     for ddl in (_CREATE_RECORDS, _CREATE_CHECKPOINT, _CREATE_OWNED, *_BASE_INDEXES):
-        cursor = await conn.execute(ddl)
-        await cursor.close()
+        await _pool.execute(conn, ddl)
     # The view is created BEFORE generated columns exist — safe and
     # load-bearing: SQLite re-expands ``SELECT r.*`` at statement-prepare
     # time, so later-added columns surface through it (spec §5.1).
-    cursor = await conn.execute(_CREATE_VIEW)
-    await cursor.close()
+    await _pool.execute(conn, _CREATE_VIEW)
 
     # Ownership is per-process, re-established by rebalances (spec §5.1):
     # a prior run's stale rows must never serve un-owned partitions at boot.
-    cursor = await conn.execute(OWNED_DELETE_ALL_SQL)
-    await cursor.close()
+    await _pool.execute(conn, OWNED_DELETE_ALL_SQL)
 
     # Generated-column reconciliation: diff via table_xinfo (generated
     # columns are INVISIBLE to table_info — using it re-adds them on every
     # boot and crashes with 'duplicate column name'; spec §5.1).
-    cursor = await conn.execute("PRAGMA table_xinfo(_records)")
-    xinfo_rows = await cursor.fetchall()
-    await cursor.close()
+    xinfo_rows = await _pool.fetch_all(conn, "PRAGMA table_xinfo(_records)")
     existing_columns = {row[1] for row in xinfo_rows}
     existing_generated = {
         row[1] for row in xinfo_rows if row[6] in (_HIDDEN_VIRTUAL, _HIDDEN_STORED)
@@ -175,11 +173,9 @@ async def migrate(
             extra={"event": "orphaned_column", "orphan": orphan},
         )
 
-    cursor = await conn.execute(
-        "SELECT sql FROM sqlite_schema WHERE name = '_records' AND type = 'table'"
+    row = await _pool.fetch_one(
+        conn, "SELECT sql FROM sqlite_schema WHERE name = '_records' AND type = 'table'"
     )
-    row = await cursor.fetchone()
-    await cursor.close()
     assert row is not None  # _records was just created above
     stored_schema: str = row[0]
 
@@ -189,11 +185,10 @@ async def migrate(
         else:
             await _execute_migration_ddl(conn, _sql.emit_add_column(column))
 
-    cursor = await conn.execute("PRAGMA index_list(_records)")
+    index_rows = await _pool.fetch_all(conn, "PRAGMA index_list(_records)")
     existing_index_names = {
-        r[1] for r in await cursor.fetchall() if not r[1].startswith("sqlite_autoindex")
+        r[1] for r in index_rows if not r[1].startswith("sqlite_autoindex")
     }
-    await cursor.close()
     declared_index_names = {i.name for i in indexes}
     for orphan in sorted(
         existing_index_names - declared_index_names - _BASE_INDEX_NAMES
@@ -222,8 +217,7 @@ async def _execute_migration_ddl(conn: aiosqlite.Connection, ddl: str) -> None:
     execution failure raises ``SchemaMigrationError`` (spec §5.1).
     """
     try:
-        cursor = await conn.execute(ddl)
-        await cursor.close()
+        await _pool.execute(conn, ddl)
     except sqlite3.Error as exc:
         raise SchemaMigrationError(f"migration DDL failed: {ddl!r}") from exc
     logger.info(
@@ -238,17 +232,13 @@ async def _existing_index_shape(
     """Return ``(key_columns, unique)`` for an existing ``_records`` index,
     or ``None`` when absent (spec §5.1: index drift via ``index_xinfo``).
     """
-    cursor = await conn.execute("PRAGMA index_list(_records)")
-    index_rows = await cursor.fetchall()
-    await cursor.close()
+    index_rows = await _pool.fetch_all(conn, "PRAGMA index_list(_records)")
     entry = next((r for r in index_rows if r[1] == name), None)
     if entry is None:
         return None
     unique = bool(entry[2])
 
-    cursor = await conn.execute(f"PRAGMA index_xinfo({name})")
-    xinfo = await cursor.fetchall()
-    await cursor.close()
+    xinfo = await _pool.fetch_all(conn, f"PRAGMA index_xinfo({name})")
     # Rows: (seqno, cid, name, desc, coll, key); key columns only, in order.
     key_columns = [r[2] for r in sorted(xinfo, key=lambda r: r[0]) if r[5] == 1]
     return key_columns, unique

@@ -1,7 +1,7 @@
 """The ChangelogTopics service (plan §3 ``_topics``; spec §7 step 0, §10).
 
 An INSTANCE: the verified-TP cache is instance state and dies with the
-store. Implements ``ChangelogNameResolver``. Grown red-first by T-01..T-09.
+store. Implements ``ChangelogNameResolver``.
 """
 
 import logging
@@ -14,14 +14,21 @@ from aiokafka.errors import (
     KafkaError,
     TopicAlreadyExistsError,
     TopicAuthorizationFailedError,
+    for_code,
 )
 
 from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
 
 from . import _sql
-from .errors import ConfigError, RehydrateError, TopicNotFoundError
+from .errors import RehydrateError, TopicNotFoundError
 
 logger = logging.getLogger("ksqlite.topics")
+
+# describe_configs reports a missing DESCRIBE_CONFIGS ACL as one of these
+# per-resource error codes (it does NOT raise the exceptions).
+_AUTHZ_ERROR_CODES = frozenset(
+    {TopicAuthorizationFailedError.errno, ClusterAuthorizationFailedError.errno}
+)
 
 
 class ChangelogTopics:
@@ -83,41 +90,58 @@ class ChangelogTopics:
         """Read ``cleanup.policy`` via describe_configs — walk the
         response's ``.resources`` config entries and substring-match
         ``compact`` (the value may be ``compact,delete``; spec §10).
+
+        Best-effort (spec §10): a per-resource error code means "could not
+        verify" (warn + proceed, never claim verified), and a compact policy
+        is reported loudly (ERROR) but never fails the assignment — topic
+        config is ops' domain. Connection-level broker failures still raise
+        (``KafkaError`` → ``RehydrateError`` in ``ensure_and_verify``).
         """
-        try:
-            responses = await self._admin.describe_configs(
-                [ConfigResource(ConfigResourceType.TOPIC, name)]
-            )
-        except (TopicAuthorizationFailedError, ClusterAuthorizationFailedError):
-            # Missing DESCRIBE_CONFIGS ACL: "could not verify" != "policy is
-            # wrong" — warn and proceed; cached-as-attempted (spec §7/§10).
-            logger.warning(
-                "cannot verify cleanup.policy of %r (missing DESCRIBE_CONFIGS "
-                "ACL); proceeding unverified",
-                name,
-                extra={"event": "policy_verify_unauthorized", "topic": name},
-            )
-            return
+        responses = await self._admin.describe_configs(
+            [ConfigResource(ConfigResourceType.TOPIC, name)]
+        )
         for response in responses:
             for resource in response.resources:
-                _error_code, _msg, _rtype, _rname, entries = resource
+                error_code, error_message, _rtype, _rname, entries = resource
+                if error_code != 0:
+                    # aiokafka reports per-resource failures (authorization
+                    # denials included) as error codes with EMPTY config
+                    # entries — it never raises them. "Could not verify" !=
+                    # "verified": warn and proceed, cached-as-attempted.
+                    event = (
+                        "policy_verify_unauthorized"
+                        if error_code in _AUTHZ_ERROR_CODES
+                        else "policy_verify_failed"
+                    )
+                    logger.warning(
+                        "cannot verify cleanup.policy of %r (error code %s:"
+                        " %s); proceeding unverified",
+                        name,
+                        error_code,
+                        error_message,
+                        extra={
+                            "event": event,
+                            "topic": name,
+                            "error_code": error_code,
+                        },
+                    )
+                    return
                 for entry in entries:
                     if entry[0] == "cleanup.policy" and "compact" in str(entry[1]):
                         logger.error(
-                            "changelog topic %r has cleanup.policy=%r",
+                            "changelog topic %r has cleanup.policy=%r;"
+                            " compaction collapses an entity to its last"
+                            " message — rebuilds from this changelog can"
+                            " lose history (spec §10)",
                             name,
                             entry[1],
                             extra={
-                                "event": "compact_rejected",
+                                "event": "compact_policy_detected",
                                 "topic": name,
                                 "policy": entry[1],
                             },
                         )
-                        raise ConfigError(
-                            f"changelog topic {name!r} has cleanup.policy="
-                            f"{entry[1]!r}; compaction would collapse an "
-                            "entity to its last message (spec §10)"
-                        )
+                        return
         logger.info(
             "verified cleanup.policy of %r",
             name,
@@ -134,11 +158,25 @@ class ChangelogTopics:
                 "retention.ms": str(self._retention),
             },
         )
-        try:
-            await self._admin.create_topics([topic])
-        except TopicAlreadyExistsError:
-            # A concurrent create counts as success (spec §7 step 0).
-            return
+        response = await self._admin.create_topics([topic])
+        # Per-topic outcomes are error codes ON THE RESPONSE — aiokafka's
+        # create_topics never raises them (verified against 0.14; contrast
+        # its create_partitions, which does walk topic_errors). Discarding
+        # them would cache a nonexistent changelog as created, never to be
+        # retried — a silent durability hole in the source of truth.
+        # Entries are (topic, error_code) in response v0, (topic, error_code,
+        # error_message) in v1+.
+        for entry in response.topic_errors:
+            error_code = entry[1]
+            if error_code == 0:
+                continue
+            if error_code == TopicAlreadyExistsError.errno:
+                # A concurrent create counts as success (spec §7 step 0).
+                return
+            message = entry[2] if len(entry) > 2 else None
+            raise for_code(error_code)(
+                f"creating changelog topic {name!r} failed: {message}"
+            )
         logger.info(
             "created changelog topic %r",
             name,

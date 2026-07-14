@@ -58,6 +58,17 @@ def test_l02_generated_column_and_index_are_frozen_dataclasses() -> None:
         ix.unique = True  # type: ignore[misc]
 
 
+def test_l02b_index_columns_snapshot_at_construction() -> None:
+    """Frozen means frozen: mutating the list the caller passed must not
+    leak into the stored config (columns is snapshotted to a tuple) — a
+    pre-start() mutation would otherwise change the emitted CREATE INDEX.
+    """
+    cols = ["thread_id"]
+    ix = ksqlite.Index("ix_thread", cols)
+    cols.append("evil")
+    assert tuple(ix.columns) == ("thread_id",)
+
+
 def test_l03_partition_state_shape() -> None:
     assert issubclass(ksqlite.PartitionStatus, enum.Enum)
     assert {m.name for m in ksqlite.PartitionStatus} == {

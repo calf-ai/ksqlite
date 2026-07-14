@@ -118,8 +118,9 @@ KSQLite logs structured events on the `ksqlite.*` loggers (a `NullHandler` is
 installed; enable INFO to see them). Events carry an `event` field —
 `rehydrate_start`, `rehydrate_end`, `rehydrate_force_stop`,
 `truncation_reset`, `checkpoint_clamped`, `foreign_record_skipped`,
-`produce_failure`, `append_to_non_ready`, and more. The truncation reset and
-checkpoint clamps are WARNING-level and operator-actionable.
+`produce_failure`, `append_to_non_ready`, `compact_policy_detected`, and
+more. The truncation reset, checkpoint clamps, and compact-policy detection
+are WARNING/ERROR-level and operator-actionable.
 
 ## Operational contract (the short version)
 
@@ -127,10 +128,12 @@ Full details: `docs/DESIGN.md` §10 and §13–§16.
 
 - **Changelog topics** are one per source `(topic, partition)`,
   single-partition, `cleanup.policy=delete` — **never compact** (compaction
-  would collapse an entity to its last message). KSQLite fail-fasts on a
-  compact changelog at the partition's first assignment; remediation is
-  documented in §10. Retention bounds rehydrate completeness — a
-  source-of-truth log wants long or infinite retention.
+  would collapse an entity to its last message). The policy check is
+  best-effort: KSQLite reports a compact changelog loudly
+  (`compact_policy_detected`, ERROR) at the partition's first assignment and
+  proceeds — topic config is ops' domain; remediation is documented in §10.
+  Retention bounds rehydrate completeness — a source-of-truth log wants long
+  or infinite retention.
 - **Best-effort, not crash-durable.** Two accepted loss windows and the
   duplicate taxonomy are documented in §14. In particular: **do not retry a
   failed `append()`** — the retry mints a new `message_id`, and if the first

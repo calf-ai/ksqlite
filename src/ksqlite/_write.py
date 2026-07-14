@@ -1,6 +1,5 @@
 """The Appender service (plan §3 ``_write``; spec §6). Depends on the
-``ChangelogNameResolver`` protocol, never on ``_topics``. Grown red-first by
-W-01..W-15.
+``ChangelogNameResolver`` protocol, never on ``_topics``.
 """
 
 import logging

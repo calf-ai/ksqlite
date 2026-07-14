@@ -1,8 +1,7 @@
 """In-memory 4-state partition machine (plan §3 ``_state``; spec §3, §4).
 
 Pure module: the authoritative state lives here (cleared with the store's
-lifetime); ``_owned`` in SQLite is only its visibility projection. Grown
-red-first by ST-01..ST-08.
+lifetime); ``_owned`` in SQLite is only its visibility projection.
 """
 
 from dataclasses import dataclass
@@ -20,7 +19,12 @@ class _Entry:
 
 
 class PartitionStateMachine:
-    """Tracks every partition encountered during this process lifetime."""
+    """Tracks every partition encountered during this process lifetime.
+
+    The ``mark_*`` methods store states; the legal transition EDGES (spec
+    §3/§7/§8) are enforced by the callers' choreography in ``_lifecycle``,
+    not by this class — it stays an allocation-cheap store by design.
+    """
 
     def __init__(self) -> None:
         self._entries: dict[TopicPartition, _Entry] = {}

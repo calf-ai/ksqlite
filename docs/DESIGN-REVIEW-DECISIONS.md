@@ -1,8 +1,11 @@
 # KSQLite — Review Resolutions Log
 
-Running log of decisions from the design-review process. To be folded into `DESIGN.md`
-once all batches are done. Status tags: **[LOCKED]** confirmed by owner; **[REC]** my
-recommendation pending confirm; **[OPEN]** not yet discussed.
+Append-only log of decisions from the design-review process. Fold-in and convergence are
+**complete** (see "Fold verified: PASS" and the convergence declaration below); the file now
+stands as the historical audit trail behind `DESIGN.md`. Entries are never rewritten — a
+superseded decision is annotated by a later entry, so early entries may name symbols the final
+API dropped. Status tags: **[LOCKED]** confirmed by owner; **[REC]** my recommendation pending
+confirm; **[OPEN]** not yet discussed.
 
 ## Terminology
 - **[LOCKED]** `conversation_id` → **`task_id`**. Model: messages → threads → **tasks**.
@@ -391,3 +394,87 @@ both are implementation-level facts the spec text already accommodates.
    raises OOR for fetch offsets above the log end as well as below the log start — the fake
    mirrors this, contract-tested). Consistent with §7's "replay terminates when the consumer
    position reaches the LEO"; pinned by RH-10 and E2E-08b.
+
+## 2026-07-14 — Post-v1 deep-review fixes (owner-approved batch)
+
+An 8-agent deep review of the merged v1 surfaced 2 critical and ~9 important findings; the owner
+approved this fix batch explicitly (per-finding dispositions below). All fixes landed TDD-first on
+branch `worktree-deep-review-fixes`.
+
+1. **[LOCKED] `create_topics` response codes are walked** (spec §7 step 0 amended): aiokafka
+   returns per-topic outcomes as `topic_errors` codes and never raises them (verified against the
+   installed 0.14 source; its `create_partitions` does the equivalent walk). Code 36
+   (TopicAlreadyExists) = concurrent-create success; any other non-zero code fails step 0 via
+   `for_code(code)` → `RehydrateError` wrap, un-cached. The fake was corrected to return codes
+   (not raise), and CF-08 pins the shape against fake AND real clients.
+2. **[LOCKED — owner] Compact-policy check is best-effort**: a `cleanup.policy` containing
+   `compact` is reported loudly (ERROR, event `compact_policy_detected`) and the assignment
+   PROCEEDS — no more `ConfigError` (spec §10/§7 step 0, README, `ConfigError` docstring all
+   amended; T-03/T-05b/T-07/T-08/F-10/E2E-05 re-pinned). Rationale (owner): topic config is
+   ops-owned; the check is advisory.
+3. **[LOCKED] `describe_configs` per-resource error codes are checked first**: aiokafka reports
+   failures (authz denials included) as per-resource codes with empty entries — the old
+   `except TopicAuthorizationFailedError` was dead against the real client and a describe error
+   was logged as "verified". Non-zero code → warn + proceed (`policy_verify_unauthorized` for
+   codes 29/31, else `policy_verify_failed`), never `topic_verified`. Fake corrected to inject
+   codes; the raise-hook remains for connection-level errors only.
+4. **[LOCKED] Replay deadline is checked on every poll iteration** (spec §7 force-stop amended):
+   the empty-fetch and truncation-reset paths previously skipped the check, so a degraded broker
+   returning `{}` forever could hold the rebalance callback unboundedly — the exact storm the
+   budget exists to prevent. A fetched batch is still always materialized + committed before the
+   check (RH-31/RH-32).
+5. **[LOCKED] Fast-path rehydrate seeds the in-memory checkpoint** from the persisted row
+   (RH-29): a warm restart previously reported `checkpoint_offset=None` / `lag=LEO` for a fully
+   caught-up partition, indefinitely.
+6. **[LOCKED] A failed rehydrate-consumer `start()` is not cached** (RH-30): the dead client is
+   best-effort-stopped and the next assignment builds a fresh one (previously one transient broker
+   blip wedged every later rehydrate).
+7. **[LOCKED] Lifecycle single-statement writes route through `TransactionRunner`** (revoke
+   DELETE, reveal INSERT, checkpoint clamp — RH-33/34/35): uniform busy retry + `StorageError`
+   mapping; the checkpoint SELECT maps `sqlite3.Error → StorageError` directly (no write lock for
+   reads). The clamp SQL moved next to `CHECKPOINT_UPSERT_SQL` in `_schema` as
+   `CHECKPOINT_CLAMP_SQL`. The assignment hook's boundary try now covers step 0 and the
+   unreached-partition path too. RH-12's commit count is 3 batch + 1 reveal.
+8. **[LOCKED] Pool-layer failures map to `StorageError` in the adapter** (C-11):
+   `PoolConnectionAcquireTimeoutError`/`PoolClosedError` are plain Exceptions with EMPTY `str()`
+   (text lives in `.message`) raised on checkout `__aenter__` — previously they bypassed the
+   documented taxonomy entirely.
+9. **[LOCKED] `open_connection` verifies WAL actually engaged** (C-01d): `PRAGMA
+   journal_mode=WAL` returns the RESULTING mode and never raises (empirically: file → `wal`,
+   `:memory:` → `memory`); a silent rollback-journal fallback breaks the uniform-pool concurrency
+   model with zero signal → now `StorageError`.
+10. **[LOCKED] `stop()` is race-free and loud** (F-14/F-15): the facade's boolean lifecycle flags
+    were replaced by a private `_RunState` enum (NEW/RUNNING/STOPPING/CLOSED); STOPPING is set
+    synchronously before the drain await (no double-close), and every failing close step is
+    logged (`stop_step_failed`) with the first exception still re-raised.
+11. **[LOCKED] `start()` rollback closes the admin client too and logs suppressed cleanup
+    failures** (`start_rollback_close_failed`; F-03 case 4 + F-03b).
+12. **[LOCKED — owner] Zombie appends stay warn-not-raise**: spec §6 wording tightened instead —
+    convergence is guaranteed only for the sole current owner; a post-revoke append can strand a
+    record the new owner never re-reads. Hosts must stop appending once the revoke hook has run.
+13. **[LOCKED] Type/API tightening**: `kafka_clients`/`pool` ctor params typed with the exported
+    Protocols; `query()` gains `@overload`s (`into=None → list[sqlite3.Row]`, `into=T → list[T]`);
+    `Index.columns`/`EncodedRecord.headers` snapshot to tuples in `__post_init__` (frozen means
+    frozen; L-02b/WF-01); `query()` resets `row_factory` on release (R-12);
+    `changelog_topic_template` rejects unknown placeholders/malformed braces at `start()` (S-07).
+14. **[LOCKED] Statement helpers** `_pool.execute/fetch_one/fetch_all` centralize the
+    close-the-cursor-immediately rule (~23 sites); `apply_materialization` feeds one params dict
+    to both statements (sqlite3 ignores unreferenced named parameters — verified empirically).
+    NOTE: aiosqlite's native `async with conn.execute(...)` idiom was deliberately NOT adopted —
+    the test suite's `RecordingConnection.execute` is a plain coroutine, so the CM idiom would
+    break every RecordingPool-proxied path.
+15. **[REC] Replay's per-record checkpoint upserts could collapse to one per batch** (N+1 → 1
+    MAX upserts; end state provably identical). NOT applied: spec §7 step 3 pins the per-record
+    "INSERT + MAX checkpoint upsert" pair and §13/I2/I4 lean on the byte-identical-pair framing —
+    needs an owner spec amendment first.
+16. **Skipped with rationale — busy-detection via `sqlite_errorcode`**: the attribute and the
+    `sqlite3.SQLITE_*` result-code constants do not exist on Python 3.10 (project floor), and
+    `sqlite_errorcode` returns EXTENDED codes (517 for BUSY_SNAPSHOT), so a naive `== 5` check
+    would regress; the current message-substring check is 3.10-safe and handles extended codes.
+17. **Skipped with rationale — `PartitionStateMachine` rename/transition-guard**: the spec's
+    vocabulary is "state machine" throughout; renaming would create doc-code drift, and edge
+    enforcement risks mis-modeled transitions. A docstring note now states that edges are
+    enforced by `_lifecycle`'s choreography.
+18. **[LOCKED — owner] CI matrix is floor + latest**: py3.10 + py3.14 (3.13 dropped; e2e job on
+    3.14). 3.14 exercises the stdlib-uuid7 branch; `test_ids.py` was restructured so the uuid6
+    backport half skips where the backport isn't installed.

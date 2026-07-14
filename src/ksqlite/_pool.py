@@ -3,19 +3,22 @@
 Connection factory (autocommit, WAL, ``busy_timeout``), the ``aiosqlitepool``
 adapter behind the ``ConnectionPool`` seam, checkout hygiene, and the
 ``BEGIN IMMEDIATE`` transaction helper with bounded ``SQLITE_BUSY`` retry.
-Grown red-first by C-01..C-10.
 """
 
 import asyncio
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import aiosqlite
-from aiosqlitepool import SQLiteConnectionPool
+from aiosqlitepool import (
+    PoolClosedError,
+    PoolConnectionAcquireTimeoutError,
+    SQLiteConnectionPool,
+)
 
 from .errors import StorageError
 
@@ -34,6 +37,48 @@ def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
     return "database is locked" in message or "busy" in message
 
 
+# The three statement helpers below centralize one load-bearing rule: every
+# cursor is closed as soon as its rows are consumed — PRAGMAs and DML return
+# rows, and an un-reset statement holds a shared lock that blocks other
+# connections' writes (C-01b).
+
+
+async def execute(
+    conn: aiosqlite.Connection,
+    sql: str,
+    parameters: Sequence[Any] | Mapping[str, Any] = (),
+) -> None:
+    """Execute one statement and immediately close its cursor."""
+    cursor = await conn.execute(sql, parameters)
+    await cursor.close()
+
+
+async def fetch_one(
+    conn: aiosqlite.Connection,
+    sql: str,
+    parameters: Sequence[Any] | Mapping[str, Any] = (),
+) -> Any:
+    """Execute, fetch the first row (or ``None``), close the cursor."""
+    cursor = await conn.execute(sql, parameters)
+    try:
+        return await cursor.fetchone()
+    finally:
+        await cursor.close()
+
+
+async def fetch_all(
+    conn: aiosqlite.Connection,
+    sql: str,
+    parameters: Sequence[Any] | Mapping[str, Any] = (),
+) -> list[Any]:
+    """Execute, fetch every row, close the cursor."""
+    cursor = await conn.execute(sql, parameters)
+    try:
+        return list(await cursor.fetchall())
+    finally:
+        await cursor.close()
+
+
 async def open_connection(
     db_path: str | Path, busy_timeout: float
 ) -> aiosqlite.Connection:
@@ -43,12 +88,21 @@ async def open_connection(
     """
     conn = await aiosqlite.connect(db_path, isolation_level=None)
     try:
-        # Both PRAGMAs return a row; an un-reset statement holds a shared lock
-        # that blocks other connections' writes (C-01b) — close each cursor.
-        cursor = await conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
-        await cursor.close()
-        cursor = await conn.execute("PRAGMA journal_mode=WAL")
-        await cursor.close()
+        await execute(conn, f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
+        row = await fetch_one(conn, "PRAGMA journal_mode=WAL")
+        # PRAGMA journal_mode does NOT raise on failure — it returns the
+        # RESULTING mode (':memory:' DBs stay 'memory'; some network/overlay
+        # filesystems keep the prior mode). The uniform read/write pool
+        # (Design B, spec §11) is only safe under WAL: silently degraded,
+        # readers and the writer serialize against each other with zero
+        # signal pointing at the cause. Fail loud instead (C-01d).
+        mode = None if row is None else str(row[0]).lower()
+        if mode != "wal":
+            raise StorageError(
+                f"could not enable WAL on {str(db_path)!r}: journal_mode is"
+                f" {mode!r} (WAL needs a regular file on a WAL-capable"
+                " filesystem)"
+            )
     except BaseException:
         # A leaked connection keeps a non-daemon worker thread alive and
         # wedges the host interpreter at exit (C-01c).
@@ -62,13 +116,11 @@ async def query_only(conn: aiosqlite.Connection) -> AsyncIterator[None]:
     """Hold ``PRAGMA query_only=ON`` for the scope; always reset in a finally
     (spec §9 read-only enforcement).
     """
-    cursor = await conn.execute("PRAGMA query_only=ON")
-    await cursor.close()
+    await execute(conn, "PRAGMA query_only=ON")
     try:
         yield
     finally:
-        cursor = await conn.execute("PRAGMA query_only=OFF")
-        await cursor.close()
+        await execute(conn, "PRAGMA query_only=OFF")
 
 
 class AiosqlitePoolAdapter:
@@ -89,16 +141,24 @@ class AiosqlitePoolAdapter:
 
     @asynccontextmanager
     async def _checked_out(self) -> AsyncIterator[aiosqlite.Connection]:
-        async with self._pool.connection() as conn:
-            # Checkout hygiene (spec §11): the inner pool only rolls back on
-            # RELEASE, so a transaction opened while the connection sat idle
-            # reaches checkout — reset it here (C-07). Likewise a stale
-            # query_only flag passes the pool's SELECT 1 health check (C-08).
-            if conn.in_transaction:
-                await conn.rollback()
-            cursor = await conn.execute("PRAGMA query_only=OFF")
-            await cursor.close()
-            yield conn
+        try:
+            async with self._pool.connection() as conn:
+                # Checkout hygiene (spec §11): the inner pool only rolls back
+                # on RELEASE, so a transaction opened while the connection sat
+                # idle reaches checkout — reset it here (C-07). Likewise a
+                # stale query_only flag passes the pool's SELECT 1 health
+                # check (C-08).
+                if conn.in_transaction:
+                    await conn.rollback()
+                await execute(conn, "PRAGMA query_only=OFF")
+                yield conn
+        except (PoolClosedError, PoolConnectionAcquireTimeoutError) as exc:
+            # Boundary mapping (spec §4): pool-layer failures — acquisition
+            # timeout under exhaustion, or the pool closed by a concurrent
+            # stop() — surface as the documented StorageError (C-11). NB:
+            # these exceptions carry their text in `.message` only; str(exc)
+            # is the empty string.
+            raise StorageError(f"connection pool failure: {exc.message}") from exc
 
     async def close(self) -> None:
         await self._pool.close()
@@ -137,8 +197,7 @@ class TransactionRunner:
         attempt = 1
         while True:
             try:
-                cursor = await conn.execute("BEGIN IMMEDIATE")
-                await cursor.close()
+                await execute(conn, "BEGIN IMMEDIATE")
                 try:
                     result = await work(conn)
                     await conn.commit()
