@@ -1,0 +1,54 @@
+# CI gates per docs/IMPLEMENTATION-PLAN.md §1 and the decisions log
+# (implementation-handoff item 1): unit job from P0 on a linux+macos matrix;
+# the coverage flags live HERE, in the unit-job invocation — never in pytest
+# addopts, which would force the unit-coverage gate onto `pytest -m e2e` runs.
+# The e2e job (required from P8) runs the real-broker suite: the conformance
+# tests only force fake<->real convergence if the real half actually executes.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Sync dependencies
+        run: uv sync --locked
+      - name: Lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: Type-check
+        run: uv run mypy
+      - name: Unit + integration tests with coverage gate
+        run: uv run pytest --cov=ksqlite --cov-report=term-missing --cov-fail-under=90
+
+  e2e:
+    name: e2e (real broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Sync dependencies
+        run: uv sync --locked
+      # Pre-pull the pinned image: pytest-timeout covers fixture setup, and
+      # a cold pull would trip the timeout (plan §4.1).
+      - name: Pre-pull the pinned Redpanda image
+        run: docker pull docker.redpanda.com/redpandadata/redpanda:v24.2.20
+      - name: E2E suite
+        run: uv run pytest -m e2e --timeout=180
