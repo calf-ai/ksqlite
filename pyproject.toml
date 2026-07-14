@@ -1,0 +1,69 @@
+[project]
+name = "ksqlite"
+version = "0.1.0"
+description = "A local, SQL-queryable, rebuildable materialized view for Kafka-consuming applications, backed durably by a per-partition Kafka changelog"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "calf ai" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "aiokafka>=0.11",
+    "aiosqlite>=0.22.1",
+    "aiosqlitepool>=1.0.0",
+    "uuid6>=2025.0.1 ; python_full_version < '3.14'",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.22,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.156.6",
+    "mypy>=2.3.0",
+    "pydantic>=2",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.15.21",
+    "testcontainers>=4.14.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Makes the test-owned fakes/utilities importable as `tests.support.*`.
+pythonpath = ["."]
+# Coverage flags live ONLY in the CI unit-job invocation (plan §1): putting them
+# here would force the unit-coverage gate onto `pytest -m e2e` runs too.
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: end-to-end tests against a real containerized broker (requires Docker)",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 60
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+# Multiple test dirs each have a conftest.py; derive module names from
+# package roots so they don't collide as top-level "conftest".
+mypy_path = ["src"]
+explicit_package_bases = true
+
+# aiokafka, aiosqlitepool, and testcontainers ship neither type stubs nor a
+# py.typed marker (verified against the installed versions); their symbols
+# type as Any at our boundary.
+[[tool.mypy.overrides]]
+module = [
+    "aiokafka",
+    "aiokafka.*",
+    "aiosqlitepool",
+    "aiosqlitepool.*",
+    "testcontainers",
+    "testcontainers.*",
+]
+ignore_missing_imports = true
