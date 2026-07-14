@@ -12,7 +12,7 @@ dependencies = [
     "aiokafka>=0.11",
     "aiosqlite>=0.22.1",
     "aiosqlitepool>=1.0.0",
-    "uuid6>=2025.0.1 ; python_full_version < '3.14'",
+    "uuid-utils>=0.17.0",
 ]
 
 [build-system]
@@ -66,12 +66,4 @@ module = [
     "testcontainers",
     "testcontainers.*",
 ]
-ignore_missing_imports = true
-
-# uuid6 is a conditional dependency: installed only below 3.14 (see its marker
-# in [project.dependencies]). On 3.14 it is absent, so mypy running on a 3.14
-# interpreter cannot resolve the import in _ids.py's <3.14 branch — ignore the
-# missing import there (a no-op where uuid6 is installed and typed).
-[[tool.mypy.overrides]]
-module = ["uuid6"]
 ignore_missing_imports = true

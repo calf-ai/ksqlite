@@ -19,9 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # Floor + latest: 3.10 exercises the uuid6-backport branch of _ids,
-        # 3.14 the stdlib-uuid7 branch (the backport is only installed below
-        # 3.14 — see its dependency marker).
+        # Floor + latest: uuid-utils (Rust-backed) ships per-version wheels,
+        # so the 3.14 leg verifies its cp314 wheel installs and works.
         python-version: ["3.10", "3.14"]
     steps:
       - uses: actions/checkout@v4
