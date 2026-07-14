@@ -1,24 +1,28 @@
 # KSQLite
 
-A library that gives a Kafka-consuming application a **local, SQL-queryable,
-rebuildable materialized view**, backed durably by a per-partition Kafka
-**changelog**. Local state lives in SQLite; when the host consumer rebalances,
-the state for a reassigned partition is rehydrated by replaying its changelog.
-It is a hand-rolled Kafka Streams state-store + changelog pattern, with SQLite
-(for real SQL querying) in place of RocksDB.
+*Turn SQLite into a distributed, durable store for your Kafka consumers:
+millisecond-local SQL on every instance, with Kafka distributing your data
+across the fleet and rehydrating it on demand.*
+
+KSQLite gives each instance of your Kafka-consuming app a fast, local SQLite
+database of the partitions it owns — durable on disk and queryable with plain
+SQL. Kafka is the distribution and recovery layer: a per-partition
+**changelog** carries every write and lives on the network, so a new or
+rebalanced instance rehydrates its local SQLite by replaying that changelog.
+Your data isn't pinned to one box — it follows partition ownership across the
+fleet.
 
 KSQLite is an embeddable library, not a service. It does not own source-topic
 consumption — your application keeps its own consumer and hooks KSQLite into
-its rebalance listener. For the full design, guarantees, and rationale, read
-[`docs/DESIGN.md`](docs/DESIGN.md).
+its rebalance listener.
 
 ## Requirements
 
 - Python >= 3.10
 - SQLite >= 3.38 linked into your interpreter (`start()` fails fast with
   `SQLiteVersionError` otherwise — see [Older SQLite runtimes](#older-sqlite-runtimes))
-- A Kafka-compatible broker (tested against Redpanda; `acks=1` and
-  idempotence-off defaults are Tansu-compatible)
+- A Kafka-compatible broker (tested against Redpanda; the defaults — `acks=1`,
+  idempotence off — also work with lightweight brokers like Tansu)
 
 ## Quickstart: materialize a topic and query it
 
@@ -57,7 +61,7 @@ its rebalance listener. For the full design, guarantees, and rationale, read
    consumer = AIOKafkaConsumer(
        bootstrap_servers="localhost:9092",
        group_id="my-app",
-       enable_auto_commit=True,   # at-most-once source consumption (spec §2)
+       enable_auto_commit=True,   # at-most-once source consumption
        auto_offset_reset="earliest",
    )
    await consumer.start()
@@ -78,7 +82,8 @@ its rebalance listener. For the full design, guarantees, and rationale, read
    ```
 
 4. **Query with plain SQL** against the auto-scoped `records` view (it shows
-   only partitions this process currently owns and has finished revealing):
+   only partitions this process currently owns and has finished loading —
+   rehydrate completed and the partition was atomically revealed to the view):
 
    ```python
    rows = await store.query(
@@ -105,39 +110,23 @@ its rebalance listener. For the full design, guarantees, and rationale, read
 5. **Shut down** with `await store.stop()` — it drains in-flight appends and
    flushes the changelog producer.
 
-## Observing partition state
-
-`store.partition_states()` (synchronous) returns a
-`dict[TopicPartition, PartitionState]` with each partition's live status
-(`RESTORING`, `READY`, `READY_PARTIAL`, `STANDBY`), its live checkpoint
-offset, and the log-end/lag values cached at the last rehydrate. A
-`READY_PARTIAL` partition was force-stopped at the replay budget and serves
-partial state — see `docs/DESIGN.md` §7.
-
-KSQLite logs structured events on the `ksqlite.*` loggers (a `NullHandler` is
-installed; enable INFO to see them). Events carry an `event` field —
-`rehydrate_start`, `rehydrate_end`, `rehydrate_force_stop`,
-`truncation_reset`, `checkpoint_clamped`, `foreign_record_skipped`,
-`produce_failure`, `append_to_non_ready`, and more. The truncation reset and
-checkpoint clamps are WARNING-level and operator-actionable.
-
 ## Operational contract (the short version)
-
-Full details: `docs/DESIGN.md` §10 and §13–§16.
 
 - **Changelog topics** are one per source `(topic, partition)`,
   single-partition, `cleanup.policy=delete` — **never compact** (compaction
-  would collapse an entity to its last message). KSQLite fail-fasts on a
-  compact changelog at the partition's first assignment; remediation is
-  documented in §10. Retention bounds rehydrate completeness — a
-  source-of-truth log wants long or infinite retention.
-- **Best-effort, not crash-durable.** Two accepted loss windows and the
-  duplicate taxonomy are documented in §14. In particular: **do not retry a
-  failed `append()`** — the retry mints a new `message_id`, and if the first
-  produce was a phantom the record materializes twice. A produce-acked /
+  would collapse an entity to its last message). KSQLite fails fast on a
+  compact changelog at the partition's first assignment; recreate the topic
+  with `cleanup.policy=delete` to remediate.
+- **Retention bounds rehydrate completeness** — a source-of-truth log wants
+  long or infinite retention.
+- **Best-effort, not end-to-end crash-durable.** Committed SQLite state
+  persists across restarts, but there are two accepted loss windows (at the
+  consume/produce boundary) and a duplicate taxonomy. In particular: **do not
+  retry a failed `append()`** — the retry mints a new `message_id`, and if the
+  first produce was a phantom the record materializes twice. A produce-acked /
   local-write-failed append self-heals on the next rehydrate.
 - **Repartitioning** a source topic breaks partition-scoped local state; the
-  partition count is assumed fixed (§2).
+  partition count is assumed fixed.
 
 ## Older SQLite runtimes
 
@@ -157,15 +146,6 @@ Caveat: `pysqlite3-binary` publishes wheels for **linux/x86_64 only**; on
 other platforms run an interpreter linking a newer SQLite. The `start()`
 version check catches every miss loudly.
 
-## Documentation map
-
-- [`docs/DESIGN.md`](docs/DESIGN.md) — the v1 specification: architecture,
-  data model, write/rehydrate/read paths, guarantees and non-guarantees.
-- [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) — the build
-  plan and the authoritative test matrix.
-- [`docs/DESIGN-REVIEW-DECISIONS.md`](docs/DESIGN-REVIEW-DECISIONS.md) — the
-  decision audit trail.
-
 ## Development
 
 ```sh
@@ -178,3 +158,8 @@ uv run ruff check && uv run ruff format --check && uv run mypy
 The end-to-end suite runs against a pinned Redpanda container
 (`docker.redpanda.com/redpandadata/redpanda:v24.2.20`) and auto-skips when
 Docker is unavailable.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE)
+file for details.

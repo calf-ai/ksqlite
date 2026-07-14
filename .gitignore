@@ -11,3 +11,6 @@ dist/
 .coverage
 .coverage.*
 htmlcov/
+
+# Local-only design notes (not tracked)
+docs/notes/

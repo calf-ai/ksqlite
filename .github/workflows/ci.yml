@@ -1,9 +1,9 @@
-# CI gates per docs/IMPLEMENTATION-PLAN.md §1 and the decisions log
-# (implementation-handoff item 1): unit job from P0 on a linux+macos matrix;
-# the coverage flags live HERE, in the unit-job invocation — never in pytest
+# CI for KSQLite: a unit job (lint, type-check, unit + integration tests with a
+# coverage gate) on a linux+macos matrix, plus an e2e job against a real broker.
+# The coverage flags live HERE, in the unit-job invocation — never in pytest
 # addopts, which would force the unit-coverage gate onto `pytest -m e2e` runs.
-# The e2e job (required from P8) runs the real-broker suite: the conformance
-# tests only force fake<->real convergence if the real half actually executes.
+# The e2e job runs the real-broker suite: the conformance tests only force
+# fake<->real convergence if the real half actually executes.
 name: CI
 
 on:
@@ -47,7 +47,7 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked
       # Pre-pull the pinned image: pytest-timeout covers fixture setup, and
-      # a cold pull would trip the timeout (plan §4.1).
+      # a cold pull would trip the timeout.
       - name: Pre-pull the pinned Redpanda image
         run: docker pull docker.redpanda.com/redpandadata/redpanda:v24.2.20
       - name: E2E suite
