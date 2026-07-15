@@ -1,5 +1,5 @@
 [project]
-name = "ksqlite"
+name = "ksqlite-py"
 version = "0.1.0"
 description = "A local, SQL-queryable, rebuildable materialized view for Kafka-consuming applications, backed durably by a per-partition Kafka changelog"
 readme = "README.md"
@@ -14,6 +14,12 @@ dependencies = [
     "aiosqlitepool>=1.0.0",
     "uuid-utils>=0.17.0",
 ]
+
+[tool.uv.build-backend]
+# The distribution is `ksqlite-py` (PyPI's `ksqlite` is an unrelated project);
+# the import package stays `ksqlite`. Without this, uv_build would derive the
+# module name from the distribution name and look for `src/ksqlite_py/`.
+module-name = "ksqlite"
 
 [build-system]
 requires = ["uv_build>=0.9.22,<0.10.0"]
