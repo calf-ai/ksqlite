@@ -1,0 +1,74 @@
+# Release automation for KSQLite. release-please watches conventional commits on
+# main and maintains a standing release PR that updates CHANGELOG.md, the version
+# in pyproject.toml, and .release-please-manifest.json. Merging that PR creates the
+# git tag and GitHub release, which is what gates the publish job below.
+#
+# release-please runs with the default GITHUB_TOKEN, so the release PR it opens does
+# NOT trigger ci.yml — GitHub suppresses workflow events for GITHUB_TOKEN-authored
+# actions to prevent recursion. If main ever requires CI checks to merge, release PRs
+# will be unmergeable until this uses a PAT or GitHub App token instead.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: release-please
+    # Every push to main runs release-please, but only a merged release PR sets
+    # release_created — that is what separates a release from ordinary commits.
+    if: needs.release-please.outputs.release_created == 'true'
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ksqlite-py/
+
+    permissions:
+      # Mints the short-lived OIDC token for PyPI trusted publishing, so no
+      # long-lived API token is stored in secrets. Requires a trusted publisher
+      # configured on PyPI for this repo, workflow filename, and environment.
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@v7
+        with:
+          # Build exactly what release-please tagged rather than whatever main
+          # points at by the time this job starts.
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          # The floor from requires-python: a pure-Python wheel built here stays
+          # installable on every version the package claims to support.
+          python-version: "3.10"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
