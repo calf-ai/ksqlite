@@ -192,7 +192,7 @@ class KSQLite:
         if acks in (0, "0"):
             raise ConfigError(
                 "producer_config['acks'] must not be 0: the append path needs"
-                " the acked offset (spec §4)"
+                " the acked offset"
             )
         declared_names: set[str] = set()
         for column in self._generated_columns:

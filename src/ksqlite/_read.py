@@ -68,9 +68,7 @@ class QueryRunner:
 def _hydrate(row: sqlite3.Row, into: type[Any]) -> Any:
     """Hydrate the row's ``payload`` column into the target (spec §9)."""
     if "payload" not in row.keys():
-        raise HydrationError(
-            "into= requires the query to select a `payload` column (spec §9)"
-        )
+        raise HydrationError("into= requires the query to select a `payload` column")
     payload = row["payload"]
     validator = getattr(into, "model_validate_json", None)
     if validator is not None:  # Pydantic v2

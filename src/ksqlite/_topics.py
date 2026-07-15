@@ -72,7 +72,7 @@ class ChangelogTopics:
                 if self._retention is None:
                     raise TopicNotFoundError(
                         f"changelog topic {name!r} does not exist and "
-                        "create_topics_retention_ms is None (spec §7 step 0)"
+                        "create_topics_retention_ms is None"
                     )
                 await self._create(name)
 
@@ -132,7 +132,7 @@ class ChangelogTopics:
                             "changelog topic %r has cleanup.policy=%r;"
                             " compaction collapses an entity to its last"
                             " message — rebuilds from this changelog can"
-                            " lose history (spec §10)",
+                            " lose history",
                             name,
                             entry[1],
                             extra={
