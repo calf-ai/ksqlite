@@ -1,7 +1,15 @@
 # Release automation for KSQLite. release-please watches conventional commits on
 # main and maintains a standing release PR that updates CHANGELOG.md, the version
-# in pyproject.toml, and .release-please-manifest.json. Merging that PR creates the
-# git tag and GitHub release, which is what gates the publish job below.
+# in pyproject.toml, uv.lock, and .release-please-manifest.json. Merging that PR
+# creates the git tag and GitHub release, which is what gates the publish job below.
+#
+# uv.lock records the root package's own version, so a bump that skips it leaves the
+# lockfile stale and every `uv sync --locked` in ci.yml fails. release-please has no
+# native uv.lock updater (googleapis/release-please#2561), so release-please-config.json
+# drives it through the generic `toml` updater instead. That jsonpath needs `.value`
+# (`@.name.value=='ksqlite-py'`, not `@.name==`) because release-please's TOML parser
+# tags every scalar as {start, end, value} to locate it for a byte-level edit; without
+# `.value` the filter matches nothing and is skipped with only a warning.
 #
 # release-please runs with the default GITHUB_TOKEN, so the release PR it opens does
 # NOT trigger ci.yml — GitHub suppresses workflow events for GITHUB_TOKEN-authored
