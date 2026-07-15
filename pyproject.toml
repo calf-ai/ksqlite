@@ -8,6 +8,24 @@ authors = [
     { name = "calf ai" }
 ]
 requires-python = ">=3.10"
+# Keep in sync with `requires-python`. CI tests the floor and the ceiling (3.10
+# and 3.14); the versions between are supported by the same `>=3.10` contract.
+# The `pypi/pyversions` README badge renders the classifiers of the last
+# PUBLISHED release, so edits here only reach the badge once a version ships.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    # No `License ::` classifier: PEP 639 deprecates it when the SPDX
+    # `license` expression above is present.
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "aiokafka>=0.11",
     "aiosqlite>=0.22.1",
@@ -51,6 +69,14 @@ markers = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 timeout = 60
+
+[tool.coverage.run]
+# Mandatory for python-coverage-comment-action, which reports the CI coverage
+# number. coverage.py records absolute paths by default, but the action reads
+# the data file inside its own Docker container, where the runner's workspace is
+# mounted at a different path — so absolute paths resolve to nothing and the
+# action fails with "No source for code". Repo-relative paths resolve in both.
+relative_files = true
 
 [tool.mypy]
 strict = true
