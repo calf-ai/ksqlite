@@ -83,7 +83,9 @@ Two instances writing to the same shard therefore each hold a local view missing
 the other's writes — and, worse than being merely stale, they cannot recover.
 Rehydrating does not fix it. Each instance's own appends have already advanced
 its checkpoint past the other's interleaved offsets, and replay resumes from the
-checkpoint, so the co-writer's records are skipped permanently. Both instances
+checkpoint, so every co-writer record at or below that checkpoint is skipped
+permanently. (Records *above* it replay normally, which is what makes the damage
+so easy to miss: some of the other writer's data does arrive.) Both instances
 settle at `READY` with a lag of 0, each missing records the changelog plainly
 holds, neither showing any sign of it. Only rebuilding from an empty database
 recovers the full log.

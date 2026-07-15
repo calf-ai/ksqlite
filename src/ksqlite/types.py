@@ -56,8 +56,9 @@ class PartitionState:
     cached as-of-the-last-rehydrate. ``lag`` (= LEO − (checkpoint + 1)) is
     recomputed per call and so is NOT purely as-of-the-last-rehydrate: it pairs
     the stale LEO with the live checkpoint, so each ``append`` after a rehydrate
-    lowers it by one and it goes negative once the checkpoint passes that LEO
-    (pinned by ``test_st03_cached_lag_semantics``).
+    lowers it by one and it goes negative once the checkpoint REACHES that LEO
+    (lag < 0 ⟺ checkpoint >= LEO). ``test_st03_cached_lag_semantics`` pins the
+    live-checkpoint/stale-LEO pairing; the negative range is currently unpinned.
     """
 
     state: PartitionStatus

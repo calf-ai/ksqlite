@@ -17,17 +17,25 @@ has lost the records the local checkpoint was counting on.
 Visibility is not a property of the partition so much as a property of a small
 table. The `records` view joins against `_owned`, and a partition's rows are
 visible exactly when it has a row there. Rehydrate writes the rows first and
-inserts into `_owned` last, so a partition appears all at once — never *partially
-visible*, with half its replayed rows showing.
+inserts into `_owned` last, so a partition appears all at once rather than
+filling in as replay proceeds.
 
-Note what that does and does not promise. It is a guarantee about visibility, not
-about completeness: a `READY_PARTIAL` partition is revealed by exactly the same
+That guarantee has a precondition worth naming: it holds only while the partition
+is *not already* revealed — a first assignment, or one following a revoke. The
+insert is an `INSERT OR IGNORE` and only revoke removes the row, so re-assigning
+a partition that is still owned replays into a view it is already joined to, and
+rows do appear in batches as they commit. The normal paths (a rebalance, or the
+revoke-then-assign recovery this documentation recommends) all satisfy the
+precondition; nothing enforces it.
+
+Note also what it does not promise. It is a guarantee about visibility, not
+completeness: a `READY_PARTIAL` partition is revealed by exactly the same
 mechanism while being genuinely half-restored. All-at-once is not the same as
 all-of-it.
 
-That ordering is why a partition whose replay raises never exposes anything: the
+The same ordering is why a partition whose replay raises exposes nothing — its
 `_owned` row was never written. Partitions revealed earlier in the same
-assignment stay visible, though — the reveal is per partition, not per call. So a
+assignment stay visible, though: the reveal is per partition, not per call. So a
 host that treats the assignment as failed is still holding partitions it can
 query.
 

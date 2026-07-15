@@ -132,8 +132,9 @@ Frozen dataclass. One partition's snapshot, as returned by
 `lag` is not stored. It is recomputed on every `partition_states()` call from a
 **live** `checkpoint_offset` and a **stale** `log_end_offset`. Since `append()`
 advances the checkpoint but never refreshes the log end offset, each append after
-a rehydrate lowers `lag` by one, and `lag` goes **negative** once the checkpoint
-passes the log end offset observed at that rehydrate:
+a rehydrate lowers `lag` by one, and `lag` goes **negative** as soon as the
+checkpoint reaches the log end offset observed at that rehydrate (`lag < 0` when
+`checkpoint_offset >= log_end_offset`):
 
 ```text
 after rehydrate:  checkpoint_offset=99   log_end_offset=100   lag=0
