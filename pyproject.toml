@@ -1,6 +1,6 @@
 [project]
 name = "ksqlite-py"
-version = "0.1.0"
+version = "0.1.1"
 description = "A local, SQL-queryable, rebuildable materialized view for Kafka-consuming applications, backed durably by a per-partition Kafka changelog"
 readme = "README.md"
 license = "MIT"
