@@ -39,9 +39,6 @@ chose.
 uv add ksqlite-py
 ```
 
-> KSQLite has not had its first release yet. Until it does, install from the
-> repository: `uv add git+ssh://git@github.com/calf-ai/ksqlite`
-
 The distribution is `ksqlite-py`; the import package is `ksqlite`.
 
 ## Quickstart

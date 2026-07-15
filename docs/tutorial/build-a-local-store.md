@@ -14,8 +14,6 @@ You'll need:
 - Python 3.10 or newer
 - [uv](https://docs.astral.sh/uv/)
 - Docker, to run a broker
-- SSH access to the KSQLite repository — it is private and not yet released, so
-  step 2 installs it from git
 
 ## Step 1 — Start a broker
 
@@ -45,7 +43,7 @@ wait a couple of seconds and run it again — the broker is still starting.
 ```sh
 uv init ksqlite-tutorial
 cd ksqlite-tutorial
-uv add git+ssh://git@github.com/calf-ai/ksqlite
+uv add ksqlite-py
 ```
 
 The last command prints the list of packages it installed. Check that KSQLite
@@ -61,8 +59,7 @@ You should see:
 KSQLite
 ```
 
-Once KSQLite has its first release, `uv add ksqlite-py` will replace the git
-command above.
+Notice the package installs as `ksqlite-py` but imports as `ksqlite`.
 
 ## Step 3 — Write some readings
 
