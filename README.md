@@ -90,8 +90,8 @@ For the same thing at a walking pace, see the
 
 ## Documentation
 
-Tutorial, how-to guides, reference, and explanation — including the operational
-contract and durability caveats — live in [docs/](docs/README.md).
+Tutorial, how-to guides, reference, and explanation live in
+[docs/](docs/README.md).
 
 ## Development
 
