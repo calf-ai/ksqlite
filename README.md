@@ -30,16 +30,13 @@ chose.
 - SQLite >= 3.38 linked into your interpreter (`start()` fails fast with
   `SQLiteVersionError` otherwise — see
   [How to run on an older SQLite](docs/how-to/run-on-older-sqlite.md))
-- A Kafka-compatible broker (tested against Redpanda; the defaults — `acks=1`,
-  idempotence off — also work with lightweight brokers like Tansu)
+- A Kafka-compatible broker
 
 ## Install
 
 ```sh
 uv add ksqlite-py
 ```
-
-The distribution is `ksqlite-py`; the import package is `ksqlite`.
 
 ## Quickstart
 
