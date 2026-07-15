@@ -23,8 +23,8 @@ jobs:
         # so the 3.14 leg verifies its cp314 wheel installs and works.
         python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Sync dependencies
@@ -42,8 +42,8 @@ jobs:
     name: e2e (real broker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.14"
       - name: Sync dependencies
