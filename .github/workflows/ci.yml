@@ -4,12 +4,33 @@
 # addopts, which would force the unit-coverage gate onto `pytest -m e2e` runs.
 # The e2e job runs the real-broker suite: the conformance tests only force
 # fake<->real convergence if the real half actually executes.
+#
+# The reported coverage number is the UNION of the unit and e2e suites: each
+# uploads its own `.coverage.*` data file as an artifact, and the `coverage` job
+# combines them. Exactly one unit leg contributes — every leg runs the same
+# tests over the same source, so the others would add no covered lines, and two
+# legs uploading under one artifact name would collide.
+#
+# The data files must record repo-relative paths (`relative_files` in
+# pyproject) — see the comment there; the reason is the action's container, not
+# this union.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# Read-only by default; the `coverage` job opts into exactly what it needs.
+permissions:
+  contents: read
+
+# Serialize runs per ref: the `coverage` job pushes the data branch without
+# force, so two overlapping main runs would race and the loser would be
+# rejected non-fast-forward. PR runs supersede each other; main runs queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -37,6 +58,27 @@ jobs:
         run: uv run mypy
       - name: Unit + integration tests with coverage gate
         run: uv run pytest --cov=ksqlite --cov-report=term-missing --cov-fail-under=90
+        # `coverage combine` (run by the `coverage` job) only picks up files
+        # named `.coverage.*`; a bare `.coverage` is ignored and the combine
+        # fails with "No data to combine". Set on every leg — harmless on the
+        # legs that do not upload.
+        env:
+          COVERAGE_FILE: .coverage.unit
+
+      # One leg only (see header). Keep this `if` in sync with the matrix — if it
+      # stops matching a real leg this step is SKIPPED, which `if-no-files-found`
+      # cannot catch (a skipped step never evaluates its inputs); the `coverage`
+      # job's named download is what fails the run in that case.
+      - name: Upload unit coverage data
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-unit
+          path: .coverage.unit
+          # upload-artifact skips dotfiles by default, and this path is one.
+          include-hidden-files: true
+          # Default is `warn`: an empty glob would upload nothing and stay green.
+          if-no-files-found: error
 
   e2e:
     name: e2e (real broker)
@@ -53,4 +95,67 @@ jobs:
       - name: Pre-pull the pinned Redpanda image
         run: docker pull docker.redpanda.com/redpandadata/redpanda:v24.2.20
       - name: E2E suite
-        run: uv run pytest -m e2e --timeout=180
+        # Coverage is collected but NOT gated here: the `--cov-fail-under` gate
+        # stays a unit-job property (see header). `--cov-report=` silences the
+        # per-run report; the combined number is reported by the `coverage` job.
+        run: uv run pytest -m e2e --timeout=180 --cov=ksqlite --cov-report=
+        env:
+          COVERAGE_FILE: .coverage.e2e
+
+      - name: Upload e2e coverage data
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-e2e
+          path: .coverage.e2e
+          include-hidden-files: true
+          if-no-files-found: error
+
+  coverage:
+    # Owns the coverage badge. Combines the unit and e2e data files into the
+    # single number published to the `python-coverage-comment-action-data`
+    # branch, which the README badge reads via img.shields.io/endpoint. Exactly
+    # one job writes that branch, so nothing races.
+    #
+    # `needs` both producers, so a failed e2e run leaves the badge at its last
+    # value rather than republishing a unit-only number as if it were the union.
+    # `needs` only covers outright job failure; the named downloads below cover
+    # a producer that goes green without leaving a data file behind.
+    name: coverage (unit + e2e)
+    needs: [unit, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit badge + data to the data branch
+      pull-requests: write # post / update the coverage comment
+    steps:
+      # The action needs the checkout's persisted credentials to push the data
+      # branch, so do not set `persist-credentials: false` here.
+      - uses: actions/checkout@v7
+      # Downloaded by explicit name, one step each, NOT by a `coverage-*`
+      # pattern: a pattern that matches only one of the two would combine and
+      # publish a partial number as if it were the union, whereas a named
+      # artifact that is missing is a hard error. This is the only check that
+      # catches a producer whose upload step was skipped rather than failed.
+      - name: Download unit coverage data
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-unit
+      - name: Download e2e coverage data
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-e2e
+      - name: Coverage comment
+        id: coverage_comment
+        uses: py-cov-action/python-coverage-comment-action@v3
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Runs `coverage combine` over the downloaded `.coverage.*` files.
+          MERGE_COVERAGE_FILES: true
+          # Badge colour only; these do NOT gate CI.
+          MINIMUM_GREEN: 90
+          MINIMUM_ORANGE: 70
+      - name: Store coverage comment (for fork / Dependabot PRs)
+        uses: actions/upload-artifact@v7
+        if: steps.coverage_comment.outputs.COMMENT_FILE_WRITTEN == 'true'
+        with:
+          name: python-coverage-comment-action
+          path: python-coverage-comment-action.txt

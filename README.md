@@ -1,5 +1,10 @@
 # KSQLite
 
+[![PyPI](https://img.shields.io/pypi/v/ksqlite-py)](https://pypi.org/project/ksqlite-py/)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/calf-ai/ksqlite/python-coverage-comment-action-data/endpoint.json)](https://github.com/calf-ai/ksqlite/tree/python-coverage-comment-action-data)
+[![Python versions](https://img.shields.io/pypi/pyversions/ksqlite-py)](https://pypi.org/project/ksqlite-py/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 *Turn SQLite into a distributed, durable store: millisecond-local SQL on every
 instance, with Kafka holding the data and rehydrating it on demand.*
 
