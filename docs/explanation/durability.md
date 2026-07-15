@@ -30,28 +30,21 @@ undo.
 SQLite. The changelog is the truth and the local copy is behind, so a rehydrate
 of that partition replays the record and applies it.
 
-That recovery is real but **conditional**, and the condition is easy to miss:
+That recovery is real but conditional, and the condition is easy to miss: it
+holds only if the partition rehydrates before any *later* append to it commits.
 
-> The record is recovered only if the partition rehydrates before any *later*
-> append to it commits locally.
-
-The reason is that `append()` advances the partition's checkpoint to its own
-offset. A later successful append therefore moves the checkpoint *past* the
-missing record, and rehydrate resumes from the checkpoint — so the gap is never
-replayed. The partition then reports `READY` with a lag of 0 while permanently
-missing a record the changelog still holds. Nothing detects this.
-
-Concretely, with offsets 0, 1, 2 where 1's local write failed and 2 succeeded:
-the changelog holds `[0, 1, 2]`, SQLite holds `[0, 2]`, the checkpoint is `2`,
-and every future rehydrate starts at `3`. Record 1 is gone locally, forever.
-
-Rehydrating immediately — before appending to that partition again — does
-recover it. See [How to handle failures](../how-to/handle-failures.md).
+The reason is that `append()` advances the checkpoint to its own offset. A later
+successful append moves the checkpoint *past* the missing record, and rehydrate
+resumes from the checkpoint, so the gap is never replayed. With offsets 0, 1, 2
+where 1's local write failed and 2 succeeded: the changelog holds `[0, 1, 2]`,
+SQLite holds `[0, 2]`, the checkpoint is `2`, and every future rehydrate starts
+at `3`. Record 1 is gone locally, forever — while the partition reports `READY`
+with a lag of 0. Nothing detects it.
 
 So the asymmetry is narrower than it first looks. Failures that leave the durable
-copy intact are *recoverable*, but not *automatically recovered*: the changelog
-still has the record, and only a rehydrate that has not been overtaken will bring
-it back.
+copy intact are *recoverable*, but not *automatically recovered*: only a
+rehydrate that has not been overtaken brings the record back. See
+[How to handle failures](../how-to/handle-failures.md).
 
 ## Why `append()` cannot be retried
 

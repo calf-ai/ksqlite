@@ -44,6 +44,9 @@ A partition becomes `READY_PARTIAL` when `rehydrate_timeout` expires during
 The budget covers the whole assignment, not each partition, so a large assignment
 is the usual cause.
 
+KSQLite logs `rehydrate_force_stop` at `INFO` each time this happens. Alert on
+it: it is the only push signal that partitions are serving incomplete data.
+
 KSQLite reveals these partitions deliberately rather than failing the
 assignment: holding the rebalance callback open longer would stall the whole
 consumer group. See
@@ -98,11 +101,11 @@ A negative `lag` is not a bug report; it just means you have appended past the
 log end offset last observed. Both `lag` and `log_end_offset` are `None` until a
 rehydrate has run.
 
-So `lag` answers "how far behind was this partition when I claimed it", which is
-useful for spotting a slow or partial restore. It does not answer "how far behind
-am I now" — nothing in KSQLite tracks that, because it never tails the changelog
-after rehydrate. If you alert on `lag`, alert on it right after an assignment,
-and do not alert on it going negative.
+So `lag` answers "how far behind was this partition when I claimed it" — but only
+until you append to it. It never answers "how far behind am I now": nothing in
+KSQLite tracks that, because it never tails the changelog after rehydrate. Read
+`lag` right after an assignment, where it is meaningful, and do not alert on it
+going negative.
 
 ## See also
 

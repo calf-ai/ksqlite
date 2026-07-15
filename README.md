@@ -117,7 +117,8 @@ Full documentation lives in [docs/](docs/README.md).
   with the same `entity_key` produce two rows.
 - **One writer per shard.** KSQLite does not arbitrate ownership and does not
   tail the changelog — an instance sees its own appends plus whatever it replayed
-  when it claimed the shard.
+  when it claimed the shard. Two instances writing to one shard diverge
+  permanently; rehydrating does not reconcile them.
 - **Best-effort, not end-to-end crash-durable.** Committed SQLite state persists
   across restarts, but records can be lost at the consume/produce boundary. In
   particular: **do not retry a failed `append()`** — the retry mints a new

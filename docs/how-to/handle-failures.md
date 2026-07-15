@@ -53,13 +53,12 @@ the broker acks without a usable offset. In both cases no local write happened.
 
 ### `StorageError` from `append()` needs action
 
-The durable copy landed and only the local copy failed, so the record can be
-recovered by replaying the changelog — but **not if you keep appending first**.
-
-`append()` advances the partition's checkpoint to its own offset. A later
-successful append moves the checkpoint past the missing record, and rehydrate
-resumes from the checkpoint, so the gap is never replayed. The partition reports
-`READY` with a lag of 0 while permanently missing the record.
+The durable copy landed and only the local copy failed, so replaying the
+changelog recovers the record — but **only if you rehydrate before appending to
+that partition again**. A later append advances the checkpoint past the gap and
+the record is then lost locally for good, with the partition still reporting
+`READY`. See [About the durability contract](../explanation/durability.md) for
+why.
 
 Stop appending to that partition and rehydrate it:
 
@@ -113,8 +112,10 @@ class StoreListener(ConsumerRebalanceListener):
 Catching `RehydrateError` does **not** catch `TopicNotFoundError` — they are
 siblings, not parent and child. Catch `KSQLiteError` if you want both.
 
-Partitions not yet revealed when the error hits stay hidden, so a failed
-assignment never exposes half-restored data.
+Partitions not yet revealed when the error hits stay hidden. Partitions revealed
+earlier in the same call stay visible, so a failed assignment can still leave you
+holding queryable partitions — including `READY_PARTIAL` ones. Check
+`partition_states()` rather than assuming the whole assignment rolled back.
 
 A `RehydrateError` naming a `format_version` means the changelog holds a record
 carrying a valid `message_id` but a version this reader does not understand —
@@ -153,8 +154,17 @@ can fix the cause and construct a new store.
 Note that a store is not reusable: `start()` after a `stop()` raises
 `LifecycleError`. Construct a new `KSQLite`.
 
+## Handle shutdown failures
+
+`stop()` attempts every close step even if an earlier one fails, then re-raises
+the first exception. Each failure is logged as `stop_step_failed` at `ERROR`.
+
+Alert on `stop_step_failed`: a close step that failed means shutdown did not
+complete cleanly, and a pool that did not close can leave SQLite worker threads
+alive and wedge interpreter exit.
+
 ## See also
 
 - [Errors](../reference/errors.md) — the full taxonomy
 - [About the durability contract](../explanation/durability.md) — why `append()` cannot be idempotent
-- [Logging](../reference/logging.md) — events to alert on
+- [Logging](../reference/logging.md) — logger names and structured events

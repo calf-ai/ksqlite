@@ -92,7 +92,7 @@ without doing anything, and `partition_states()` has no lifecycle check at all.
 | `ChangelogProduceError` | No. A retry mints a new `message_id`, which does not deduplicate against the first attempt. |
 | `StorageError` from `append()` | No. The produce already succeeded. |
 | `StorageError` from `query()` | Yes. Reads have no side effects. |
-| `RehydrateError` | No. Raised through the rebalance callback. |
+| `RehydrateError` | Not in place. The partition can be re-assigned, which replays from its checkpoint. |
 | `TopicNotFoundError` | Only once the changelog topic exists. |
 | `ConfigError`, `SQLiteVersionError` | No. |
 
