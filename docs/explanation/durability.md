@@ -27,14 +27,31 @@ as KSQLite is concerned. This is clean: no local state to reconcile, nothing to
 undo.
 
 **Produce succeeds, local write fails.** The record is in the changelog but not in
-SQLite. This looks bad and is actually the benign case: the changelog is the
-truth, and the local copy is behind. The next rehydrate of that partition replays
-the record and applies it. The store heals itself, and there is nothing for you
-to do.
+SQLite. The changelog is the truth and the local copy is behind, so a rehydrate
+of that partition replays the record and applies it.
 
-That asymmetry is the design working. Failures that leave the durable copy intact
-are recoverable by construction; only failures *before* the durable copy exists
-can lose anything.
+That recovery is real but **conditional**, and the condition is easy to miss:
+
+> The record is recovered only if the partition rehydrates before any *later*
+> append to it commits locally.
+
+The reason is that `append()` advances the partition's checkpoint to its own
+offset. A later successful append therefore moves the checkpoint *past* the
+missing record, and rehydrate resumes from the checkpoint — so the gap is never
+replayed. The partition then reports `READY` with a lag of 0 while permanently
+missing a record the changelog still holds. Nothing detects this.
+
+Concretely, with offsets 0, 1, 2 where 1's local write failed and 2 succeeded:
+the changelog holds `[0, 1, 2]`, SQLite holds `[0, 2]`, the checkpoint is `2`,
+and every future rehydrate starts at `3`. Record 1 is gone locally, forever.
+
+Rehydrating immediately — before appending to that partition again — does
+recover it. See [How to handle failures](../how-to/handle-failures.md).
+
+So the asymmetry is narrower than it first looks. Failures that leave the durable
+copy intact are *recoverable*, but not *automatically recovered*: the changelog
+still has the record, and only a rehydrate that has not been overtaken will bring
+it back.
 
 ## Why `append()` cannot be retried
 

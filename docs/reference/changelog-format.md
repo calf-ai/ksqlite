@@ -75,13 +75,10 @@ Every record read during rehydrate is classified by its headers and body.
 | Value is null, or not UTF-8 | Skipped as foreign; logged. |
 | Otherwise | Applied to `_records`. |
 
-The order matters: a record carrying a valid `message_id` is a KSQLite record, so
-a version this reader does not understand fails loudly rather than being dropped.
-A record without a valid `message_id` was written by something else and is
-skipped.
+Conditions are evaluated in the order listed: `message_id` is checked before
+`format_version`, which is checked before the key and value.
 
-A skipped foreign record still advances the checkpoint, so foreign records in a
-changelog do not force repeated replay.
+A skipped foreign record still advances the checkpoint.
 
 ## Idempotence
 
@@ -89,8 +86,8 @@ changelog do not force repeated replay.
 `ON CONFLICT (message_id) DO NOTHING` using the same statement, so replaying a
 changelog any number of times converges to the same rows.
 
-This is why a failed `append()` must not be retried: a retry mints a **new**
-`message_id`, which does not deduplicate against the first attempt. See
+A retried `append()` mints a new `message_id` and therefore does not deduplicate
+against the first attempt. See
 [About the durability contract](../explanation/durability.md).
 
 ## See also

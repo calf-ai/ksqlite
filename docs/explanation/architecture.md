@@ -77,9 +77,20 @@ The most common wrong assumption about KSQLite is that instances share a view of
 the data. They do not.
 
 An instance sees its own appends, plus whatever it replayed when it claimed the
-shard. Nothing tails the changelog afterwards. Two instances writing to the same
-shard will each hold a local view missing the other's writes until they
-rehydrate — and they will not converge on their own.
+shard. Nothing tails the changelog afterwards.
+
+Two instances writing to the same shard therefore each hold a local view missing
+the other's writes — and, worse than being merely stale, they cannot recover.
+Rehydrating does not fix it. Each instance's own appends have already advanced
+its checkpoint past the other's interleaved offsets, and replay resumes from the
+checkpoint, so the co-writer's records are skipped permanently. Both instances
+settle at `READY` with a lag of 0, each missing records the changelog plainly
+holds, neither showing any sign of it. Only rebuilding from an empty database
+recovers the full log.
+
+This is why "one writer per shard" is a hard rule rather than a performance
+guideline. Violating it does not cause conflicts you can detect and reconcile —
+it causes silent, permanent divergence.
 
 So the model is *partition ownership*: one owner per shard at a time, holding a
 private local copy, with the changelog as the handoff mechanism between owners.

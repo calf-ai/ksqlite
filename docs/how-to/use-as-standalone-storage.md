@@ -13,23 +13,19 @@ used KSQLite before, work through
 [Build a local store that rebuilds itself from Kafka](../tutorial/build-a-local-store.md)
 first.
 
-## Know what you are getting
+## Constraints to design around
 
-Read this before designing around it.
-
-- **One writer per shard.** KSQLite does not arbitrate ownership and does not
-  tail the changelog. An instance sees its own appends plus whatever it replayed
-  when it claimed the shard — never another instance's later writes. Two
-  instances writing to one shard will not see each other until they rehydrate.
-- **Append-only.** `append()` inserts. It never updates or deletes. Two appends
-  with the same `entity_key` produce two rows. See
+- **One writer per shard, always.** Two instances appending to one shard diverge
+  permanently and silently — rehydrating does not reconcile them.
+- **No tailing.** An instance sees its own appends plus whatever it replayed when
+  it claimed the shard. Nothing arrives after that without another rehydrate.
+- **Append-only.** `append()` inserts; it never updates or deletes. See
   [How to query the latest value per entity](query-latest-per-entity.md).
-- **The changelog is the source of truth.** The SQLite file is a disposable
-  local copy; anything the changelog no longer holds is gone for good.
+- **The changelog is the only durable copy.** Anything it no longer holds is gone.
 
-If you need many instances reading the same continuously-updated data, this is
-not that. This is partition ownership: one owner per shard at a time, with fast
-local SQL for the owner.
+If you need many instances reading the same continuously-updated data, KSQLite is
+the wrong tool. For why these hold, see
+[About the KSQLite architecture](../explanation/architecture.md).
 
 ## Step 1 — Choose shard identities
 
@@ -42,6 +38,12 @@ from aiokafka import TopicPartition
 
 SHARD = TopicPartition("device-state", 0)  # -> changelog: device-state.p0.changelog
 ```
+
+The name is free, but the changelog name it resolves to through
+`changelog_topic_template` must be a legal Kafka topic name — at most 249
+characters, and only `[A-Za-z0-9._-]`. A shard named `"device state"` resolves to
+`device state.p0.changelog` and raises `ConfigError`, not at `start()` but on the
+first `append()` or assignment that needs it.
 
 Choose the number of shards up front. Shards are how you divide data across
 instances, and re-dividing later means rebuilding state, so pick a count you can
@@ -132,7 +134,8 @@ again it resumes from the checkpoint instead of replaying everything. The new
 owner calls `on_partitions_assigned` and replays the changelog.
 
 Release before the new owner claims. Two owners writing at once will not corrupt
-the changelog, but each will hold a local view missing the other's writes.
+the changelog, but each ends up permanently missing the other's records — a gap
+no rehydrate repairs.
 
 At shutdown, `await store.stop()` is enough on its own — `start()` clears
 ownership, so a restarted process never serves rows it has not re-claimed.

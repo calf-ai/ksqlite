@@ -45,14 +45,35 @@ Each `append()` error tells you a different thing about what happened:
 |---|---|---|---|
 | `ValueError` | Nothing produced | Nothing written | Fix the call. Bad `entity_key` or payload. |
 | `ChangelogProduceError` | Possibly written | Nothing written | Do not retry. The record may or may not be in the changelog. |
-| `StorageError` | Written | Failed | Do nothing. The next rehydrate applies it. |
-
-`StorageError` from `append()` is the benign one: the durable copy landed, only
-the local copy failed. The record materializes on the next rehydrate of that
-partition, so the store self-heals.
+| `StorageError` | Written | Failed | Rehydrate that partition **before appending to it again**. |
+| `ConfigError` | Nothing produced | Nothing written | Fix the template or shard name. The resolved changelog name is not a legal Kafka topic name. |
 
 `ChangelogProduceError` is raised both when the produce fails outright and when
 the broker acks without a usable offset. In both cases no local write happened.
+
+### `StorageError` from `append()` needs action
+
+The durable copy landed and only the local copy failed, so the record can be
+recovered by replaying the changelog — but **not if you keep appending first**.
+
+`append()` advances the partition's checkpoint to its own offset. A later
+successful append moves the checkpoint past the missing record, and rehydrate
+resumes from the checkpoint, so the gap is never replayed. The partition reports
+`READY` with a lag of 0 while permanently missing the record.
+
+Stop appending to that partition and rehydrate it:
+
+```python
+try:
+    await store.append(source=tp, entity_key=key, payload=value)
+except StorageError:
+    logger.exception("local write failed for %s; rehydrating before further appends", tp)
+    await store.on_partitions_revoked([tp])
+    await store.on_partitions_assigned([tp])   # replays the missing record
+```
+
+If your consumer is driving appends for that partition, stop it first — any
+append that commits before the rehydrate closes the window for good.
 
 ## Handle bad input before it reaches `append()`
 
@@ -95,9 +116,11 @@ siblings, not parent and child. Catch `KSQLiteError` if you want both.
 Partitions not yet revealed when the error hits stay hidden, so a failed
 assignment never exposes half-restored data.
 
-A `RehydrateError` naming a `format_version` means the changelog holds records
-written by a newer KSQLite than this process understands. Do not delete the
-topic; roll the reader forward.
+A `RehydrateError` naming a `format_version` means the changelog holds a record
+carrying a valid `message_id` but a version this reader does not understand —
+either written by a newer KSQLite, or missing the `format_version` header
+entirely (reported as `format_version=None`). Do not delete the topic. If it is
+the newer-writer case, roll the reader forward.
 
 ## Handle query failures
 

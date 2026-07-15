@@ -78,9 +78,12 @@ Retention decides what a rebuild can recover. A changelog you treat as a source
 of truth wants infinite retention (`-1`).
 
 If retention does trim records that a local checkpoint depended on, the next
-rehydrate detects it, logs `truncation_reset` and `checkpoint_clamped` at
-`WARNING`, and replays what is left. The store keeps working; the trimmed records
-are gone. Alert on both events.
+rehydrate detects it, logs `truncation_reset` at `WARNING`, and replays what is
+left. The store keeps working; the trimmed records are gone.
+
+`checkpoint_clamped` is a separate, rarer event — it fires only when the
+checkpoint ends up above the changelog's log end offset, or the log was trimmed
+away entirely. An ordinary trim logs `truncation_reset` alone. Alert on both.
 
 ## Step 3 — Let a missing topic fail loudly
 

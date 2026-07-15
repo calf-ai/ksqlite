@@ -43,12 +43,24 @@ wait a couple of seconds and run it again — the broker is still starting.
 ```sh
 uv init ksqlite-tutorial
 cd ksqlite-tutorial
-uv add ksqlite-py
+uv add git+ssh://git@github.com/calf-ai/ksqlite
 ```
 
-> **Note:** KSQLite has not had its first release yet. Until it does, install it
-> from the repository instead:
-> `uv add git+ssh://git@github.com/calf-ai/ksqlite`
+The last command prints the list of packages it installed. Check that KSQLite
+imports:
+
+```sh
+uv run python -c "import ksqlite; print(ksqlite.KSQLite.__name__)"
+```
+
+You should see:
+
+```text
+KSQLite
+```
+
+Once KSQLite has its first release, `uv add ksqlite-py` will replace the git
+command above. Either way the import is `ksqlite`.
 
 ## Step 3 — Write some readings
 

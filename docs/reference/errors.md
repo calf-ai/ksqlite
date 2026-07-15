@@ -29,7 +29,7 @@ KSQLiteError
 | Class | Meaning | Raised by |
 |---|---|---|
 | `KSQLiteError` | Base class. Also raised directly when the producer or admin client fails to start. | `start()` |
-| `ConfigError` | Invalid configuration, or stored schema drift. | `start()` |
+| `ConfigError` | Invalid configuration, stored schema drift, or a resolved changelog name that is not a legal Kafka topic name. | `start()`, `append()`, `on_partitions_assigned()` |
 | `SQLiteVersionError` | The SQLite runtime is older than 3.38. | `start()` |
 | `SchemaMigrationError` | An `ALTER TABLE` or `CREATE INDEX` failed to execute. | `start()` |
 | `ChangelogProduceError` | The changelog produce failed, or the broker acked with `offset < 0`. | `append()` |
@@ -37,7 +37,16 @@ KSQLiteError
 | `RehydrateError` | A replay, broker, or database error during rehydrate, or an unrecognized `format_version`. | `on_partitions_assigned()` |
 | `HydrationError` | `into=` was used but the result has no `payload` column. | `query()` |
 | `LifecycleError` | Lifecycle misuse. | `start()`, `stop()`, and every operation |
-| `StorageError` | A SQLite or connection-pool failure. | `start()`, `append()`, `query()`, both hooks |
+| `StorageError` | A SQLite or connection-pool failure. | `start()`, `append()`, `query()`, `on_partitions_revoked()` |
+
+`on_partitions_assigned()` does not raise `StorageError`: a SQLite or pool failure
+inside it is converted to `RehydrateError`, with the `StorageError` as
+`__cause__`. `on_partitions_revoked()` raises it directly.
+
+`ConfigError` is not only a `start()` error. The resolved changelog topic name is
+validated when it is first needed, so a template that `start()` accepts can still
+raise `ConfigError` from `append()` or `on_partitions_assigned()` if it resolves
+to an illegal name. It is not converted to `RehydrateError`.
 
 ## Errors that are not `KSQLiteError`
 
@@ -47,10 +56,13 @@ taxonomy.
 | Class | Meaning | Raised by |
 |---|---|---|
 | `ValueError` | `entity_key` is empty, not a `str`, or not UTF-8-encodable; or `payload` is not JSON-serializable, is not valid JSON, or contains `NaN`/`Infinity`/`-Infinity`. | `append()` |
-| `TypeError` | `into=` is neither a Pydantic v2 model nor a dataclass. | `query()` |
+| `TypeError` | `into=` is neither a Pydantic v2 model nor a dataclass; or `into=` is a dataclass whose fields do not match the payload. | `query()` |
+| `pydantic.ValidationError` | `into=` is a Pydantic model and a payload fails its validation. | `query()` |
 
-Both indicate a bug in the calling code rather than a runtime condition, and
-both are raised before any produce or write occurs.
+All indicate a mismatch between the calling code and the data rather than a
+runtime fault. `ValueError` is raised before anything is produced or written.
+The `query()` errors are raised while hydrating rows, so they never fire on an
+empty result.
 
 ## `StorageError` conditions
 
@@ -77,12 +89,15 @@ without doing anything, and `partition_states()` has no lifecycle check at all.
 
 | Error | Retryable |
 |---|---|
-| `ChangelogProduceError` | **No.** Retrying `append()` mints a new `message_id` and can materialize the record twice. See [How to handle failures](../how-to/handle-failures.md). |
-| `StorageError` from `append()` | No. The changelog produce already succeeded; the next rehydrate applies the record. |
+| `ChangelogProduceError` | No. A retry mints a new `message_id`, which does not deduplicate against the first attempt. |
+| `StorageError` from `append()` | No. The produce already succeeded. |
 | `StorageError` from `query()` | Yes. Reads have no side effects. |
-| `RehydrateError` | Treat the assignment as failed. Raised through the rebalance callback. |
-| `TopicNotFoundError` | Only after the changelog topic exists. |
-| `ConfigError`, `SQLiteVersionError` | No. Fix the configuration or the runtime. |
+| `RehydrateError` | No. Raised through the rebalance callback. |
+| `TopicNotFoundError` | Only once the changelog topic exists. |
+| `ConfigError`, `SQLiteVersionError` | No. |
+
+See [How to handle failures](../how-to/handle-failures.md) for what to do about
+each.
 
 ## See also
 

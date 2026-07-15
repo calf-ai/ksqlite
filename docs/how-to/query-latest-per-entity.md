@@ -20,19 +20,19 @@ offsets increase with every append.
 
 Use a window function, partitioning by the shard **and** the entity key:
 
-```sql
-SELECT source_topic, source_partition, entity_key, payload
-FROM (
-    SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY source_topic, source_partition, entity_key
-        ORDER BY changelog_offset DESC
-    ) AS rn
-    FROM records
-)
-WHERE rn = 1
-```
-
 ```python
+LATEST_SQL = """
+    SELECT source_topic, source_partition, entity_key, payload
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY source_topic, source_partition, entity_key
+            ORDER BY changelog_offset DESC
+        ) AS rn
+        FROM records
+    )
+    WHERE rn = 1
+"""
+
 rows = await store.query(LATEST_SQL)
 ```
 
@@ -76,21 +76,18 @@ Always include `source_topic` and `source_partition` in the partitioning, as the
 working query above does. If your process only ever owns one shard the bug is
 invisible; it appears the day it owns two.
 
-## Delete superseded rows
+## Local growth is unbounded
 
-Nothing prunes old versions. If a store holds many revisions per entity, the
-table grows without limit.
+Nothing prunes superseded rows, so a store holding many revisions per entity
+grows without limit. Two facts constrain what you can do about it:
 
-You cannot delete through `query()` — it runs read-only and raises
-`StorageError`. Deleting also only affects this local copy: the changelog still
-holds every record, so the next rehydrate brings them all back.
+- `query()` is read-only. A `DELETE` through it raises `StorageError`.
+- Deleting rows by other means only changes this local copy. The changelog still
+  holds every record, so the next rehydrate restores them.
 
-So there is no way to bound local growth that a rehydrate will not undo. If
-unbounded history is a problem for your workload, the options are to append less
-— write a revision only when something meaningful changed — or to accept that the
-changelog's retention bounds history, remembering that trimming a changelog you
-rely on as a source of truth loses those records permanently. See
-[How to provision changelog topics](provision-changelog-topics.md).
+The levers that remain are appending less, or bounding the changelog's retention
+— which permanently discards records you may be treating as a source of truth.
+See [How to provision changelog topics](provision-changelog-topics.md).
 
 ## See also
 

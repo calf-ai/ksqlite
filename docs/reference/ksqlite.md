@@ -155,6 +155,7 @@ Appending to a partition that is not `READY` logs a warning and proceeds.
 | `ValueError` | `entity_key` is empty, not a `str`, or not UTF-8-encodable; or `payload` is not JSON-serializable or not valid JSON. |
 | `ChangelogProduceError` | The produce failed, or the broker acked without a usable offset. No local write occurred. |
 | `StorageError` | The local write failed after the produce succeeded. |
+| `ConfigError` | The resolved changelog topic name is not a legal Kafka topic name. |
 | `LifecycleError` | Called before `start()` or after `stop()`. |
 
 A failed `append()` must not be retried. See
@@ -187,8 +188,9 @@ rows = await store.query("SELECT payload FROM records WHERE thread_id = ?", ["th
 
 ### `partition_states() -> dict[TopicPartition, PartitionState]`
 
-Returns a snapshot of every partition seen during this process's lifetime, keyed
-by source partition. Synchronous.
+Returns a snapshot of every partition this store has seen since `start()`, keyed
+by source partition. Synchronous. Has no lifecycle check, so it does not raise
+`LifecycleError`.
 
 See [`PartitionState`](types.md#partitionstate) for field semantics.
 
@@ -200,32 +202,32 @@ assigned, its rows are invisible to `query()`.
 
 `assigned` is any iterable of `TopicPartition`.
 
-Call it from your consumer's rebalance listener before your own logic reads
-state, or call it directly if you are not consuming a source topic. See
-[How to use KSQLite as standalone storage](../how-to/use-as-standalone-storage.md).
-
 The whole call shares one `rehydrate_timeout` budget. Partitions the budget does
 not cover are revealed as `READY_PARTIAL`.
 
 | Raises | When |
 |---|---|
 | `TopicNotFoundError` | The changelog topic does not exist and `create_topics_retention_ms` is `None`. |
-| `RehydrateError` | A broker or database error during rehydrate, or a changelog record carrying an unrecognized `format_version`. |
+| `RehydrateError` | A broker or database error during rehydrate, or a changelog record carrying an unrecognized or absent `format_version`. A `StorageError` cause surfaces as `RehydrateError`. |
+| `ConfigError` | The resolved changelog topic name is not a legal Kafka topic name. |
 | `LifecycleError` | Called before `start()` or after `stop()`. |
 
-On error, partitions not yet revealed in this call stay hidden.
+On error, partitions not yet revealed in this call stay hidden. Partitions
+already revealed earlier in the same call remain visible.
 
 ### `async on_partitions_revoked(revoked) -> None`
 
 Releases ownership: hides each revoked partition from the `records` view and
-marks it `STANDBY`. Call it from your consumer's rebalance listener after your
-own logic has flushed, or directly when releasing a shard.
+marks it `STANDBY`.
 
 Rows and checkpoints are kept, so a later reassignment resumes from the
 checkpoint instead of replaying the whole changelog. Revoking a partition this
 store never owned does nothing.
 
-Raises `LifecycleError` if called before `start()` or after `stop()`.
+| Raises | When |
+|---|---|
+| `StorageError` | A SQLite or connection-pool failure while hiding the partition. |
+| `LifecycleError` | Called before `start()` or after `stop()`. |
 
 ## See also
 

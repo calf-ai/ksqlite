@@ -52,9 +52,12 @@ class PartitionStatus(Enum):
 class PartitionState:
     """Snapshot of one partition's state (``partition_states()`` value).
 
-    ``state`` and ``checkpoint_offset`` are live; ``log_end_offset`` (= LEO)
-    and ``lag`` (= LEO − (checkpoint + 1)) are cached as-of-the-last-rehydrate
-    (spec §4).
+    ``state`` and ``checkpoint_offset`` are live. ``log_end_offset`` (= LEO) is
+    cached as-of-the-last-rehydrate. ``lag`` (= LEO − (checkpoint + 1)) is
+    recomputed per call and so is NOT purely as-of-the-last-rehydrate: it pairs
+    the stale LEO with the live checkpoint, so each ``append`` after a rehydrate
+    lowers it by one and it goes negative once the checkpoint passes that LEO
+    (pinned by ``test_st03_cached_lag_semantics``).
     """
 
     state: PartitionStatus

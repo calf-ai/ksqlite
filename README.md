@@ -19,6 +19,11 @@ KSQLite is an embeddable library, not a service. Use it two ways:
   local SQL storage that any instance can rebuild — Kafka is deployed to hold
   the data, not to feed it.
 
+A **shard** is one unit of ownership: a single `(topic, partition)`, backed by
+one changelog topic. The API spells it `TopicPartition`. When you consume a
+topic, a shard is one of its partitions; when you don't, it's just a name you
+chose.
+
 ## Requirements
 
 - Python >= 3.10
@@ -117,8 +122,12 @@ Full documentation lives in [docs/](docs/README.md).
   across restarts, but records can be lost at the consume/produce boundary. In
   particular: **do not retry a failed `append()`** — the retry mints a new
   `message_id`, and if the first produce was a phantom the record materializes
-  twice. A produce-acked / local-write-failed append self-heals on the next
-  rehydrate.
+  twice.
+- **A produce-acked / local-write-failed append is recovered by the next
+  rehydrate _only if no later append to that partition commits first_** — a
+  later append advances the checkpoint past the missing record, and the partition
+  then reports `READY`/lag 0 while permanently missing it. See
+  [How to handle failures](docs/how-to/handle-failures.md).
 - **Repartitioning** a source topic breaks partition-scoped local state; the
   partition count is assumed fixed.
 

@@ -53,9 +53,10 @@ Applied in `start()`; failures raise `ConfigError`.
 
 ### Drift
 
-If a declared column already exists in the stored schema with a different
-extraction expression, `start()` raises `ConfigError`. A generated column
-removed from the configuration is left in the table and logged.
+`start()` raises `ConfigError` when a declared column already exists in the
+stored schema under a different clause — that is, when its `sql_type` or
+`json_path` no longer matches. A generated column removed from the configuration
+is left in the table and logged.
 
 ```python
 GeneratedColumn("thread_id", "$.thread_id")
@@ -124,13 +125,23 @@ Frozen dataclass. One partition's snapshot, as returned by
 | Field | Type | Freshness | Description |
 |---|---|---|---|
 | `state` | `PartitionStatus` | live | The partition's current state. |
-| `checkpoint_offset` | `int \| None` | live | Highest changelog offset applied locally. `None` if nothing has been applied. |
+| `checkpoint_offset` | `int \| None` | live | The partition's checkpoint: the changelog offset replay would resume after. `None` if nothing has been applied. |
 | `log_end_offset` | `int \| None` | as of last rehydrate | Changelog log end offset observed during the last rehydrate. `None` until a rehydrate has run. |
-| `lag` | `int \| None` | as of last rehydrate | `log_end_offset - (checkpoint_offset + 1)`, or `log_end_offset` when `checkpoint_offset` is `None`. `None` until a rehydrate has run. |
+| `lag` | `int \| None` | mixed — see below | `log_end_offset - (checkpoint_offset + 1)`, or `log_end_offset` when `checkpoint_offset` is `None`. `None` until a rehydrate has run. |
 
-`log_end_offset` and `lag` are not refreshed by `append()`, so `lag` does not
-track a partition that is being written to. It describes the gap measured at the
-last rehydrate.
+`lag` is not stored. It is recomputed on every `partition_states()` call from a
+**live** `checkpoint_offset` and a **stale** `log_end_offset`. Since `append()`
+advances the checkpoint but never refreshes the log end offset, each append after
+a rehydrate lowers `lag` by one, and `lag` goes **negative** once the checkpoint
+passes the log end offset observed at that rehydrate:
+
+```text
+after rehydrate:  checkpoint_offset=99   log_end_offset=100   lag=0
+after 5 appends:  checkpoint_offset=104  log_end_offset=100   lag=-5
+```
+
+`checkpoint_offset` is normally the highest changelog offset applied locally, but
+a truncation reset can clamp it to an offset that was never applied.
 
 ## `ConnectionPool`
 
@@ -144,8 +155,7 @@ class ConnectionPool(Protocol):
 ```
 
 The default implementation wraps `aiosqlitepool`, opening each connection with
-`isolation_level=None`, `PRAGMA busy_timeout`, and WAL. The seam exists for
-testing and injection.
+`isolation_level=None`, `PRAGMA busy_timeout`, and WAL.
 
 ## `KafkaClientFactory`
 

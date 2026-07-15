@@ -76,22 +76,33 @@ completeness.
 
 ## Do not use `lag` as a live metric
 
-`lag` and `log_end_offset` are captured at rehydrate and **not refreshed
-afterwards**. They describe the gap measured when the partition was last
-assigned, not the gap now:
+`lag` is not a live measure of how far behind a partition is, and it will mislead
+you if you treat it as one — but not because it is frozen.
+
+`log_end_offset` **is** frozen: it is captured at rehydrate and never refreshed.
+`lag` is recomputed on every call from that stale log end offset against the
+**live** checkpoint. Since `append()` advances the checkpoint, every append after
+a rehydrate lowers `lag` by one — and drives it negative:
 
 ```python
 state = store.partition_states()[tp]
-state.lag  # as of the last rehydrate; appends do not update it
+state.lag  # stale log_end_offset minus live checkpoint; goes negative as you append
 ```
 
-Both are `None` until a rehydrate has run. `checkpoint_offset` and `state` are
-live.
+```text
+after rehydrate:  checkpoint_offset=99   log_end_offset=100   lag=0
+after 5 appends:  checkpoint_offset=104  log_end_offset=100   lag=-5
+```
+
+A negative `lag` is not a bug report; it just means you have appended past the
+log end offset last observed. Both `lag` and `log_end_offset` are `None` until a
+rehydrate has run.
 
 So `lag` answers "how far behind was this partition when I claimed it", which is
 useful for spotting a slow or partial restore. It does not answer "how far behind
 am I now" — nothing in KSQLite tracks that, because it never tails the changelog
-after rehydrate.
+after rehydrate. If you alert on `lag`, alert on it right after an assignment,
+and do not alert on it going negative.
 
 ## See also
 

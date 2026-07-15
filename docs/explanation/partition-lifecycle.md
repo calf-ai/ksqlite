@@ -17,12 +17,19 @@ has lost the records the local checkpoint was counting on.
 Visibility is not a property of the partition so much as a property of a small
 table. The `records` view joins against `_owned`, and a partition's rows are
 visible exactly when it has a row there. Rehydrate writes the rows first and
-inserts into `_owned` last, so a partition appears all at once, fully replayed —
-never half-restored.
+inserts into `_owned` last, so a partition appears all at once — never *partially
+visible*, with half its replayed rows showing.
 
-That ordering is the whole reveal mechanism, and it is why a failed assignment
-cannot expose partial data: if replay raises, the `_owned` row was never written,
-so nothing became visible.
+Note what that does and does not promise. It is a guarantee about visibility, not
+about completeness: a `READY_PARTIAL` partition is revealed by exactly the same
+mechanism while being genuinely half-restored. All-at-once is not the same as
+all-of-it.
+
+That ordering is why a partition whose replay raises never exposes anything: the
+`_owned` row was never written. Partitions revealed earlier in the same
+assignment stay visible, though — the reveal is per partition, not per call. So a
+host that treats the assignment as failed is still holding partitions it can
+query.
 
 `start()` empties `_owned` entirely. A restarted process inherits a database full
 of rows from partitions it may no longer own, and serving those would be a
@@ -120,15 +127,18 @@ real fix is retention that does not trim a source of truth.
 records the changelog does not have. Left alone, this would make every future
 rehydrate try to read past the end and reset again, forever.
 
-Both are repaired by moving the checkpoint — the only writes that move it
-backwards, and the reason the checkpoint is otherwise strictly monotonic. Without
-the clamp, a partition in either state would re-enter the reset path on every
-single assignment, replaying the entire changelog each time and never
-converging. The clamp turns a permanent malfunction into a single logged
-incident.
+Both are repaired by moving the checkpoint. These two clamps are the only writes
+that bypass the `MAX()` upsert — the reason the checkpoint is otherwise strictly
+monotonic — and they move it in opposite directions: down to the log end offset
+minus one when it sat above the log, or up past a gap the log no longer holds.
 
-Both clamps log at `WARNING` rather than `INFO` because they are only ever
-symptoms. Nothing that happens in normal operation moves a checkpoint backwards.
+Without them, a partition in either state would re-enter the reset path on every
+single assignment, replaying the changelog each time and never converging. The
+clamp turns a permanent malfunction into a single logged incident.
+
+Both log at `WARNING` rather than `INFO` because they are only ever symptoms.
+Nothing in normal operation writes a checkpoint that the `MAX()` upsert could not
+have produced.
 
 ## See also
 

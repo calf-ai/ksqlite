@@ -9,6 +9,11 @@ It is a library, not a service. It works attached to a Kafka consumer, where
 local state follows partition ownership around a fleet — and equally well with no
 consumer at all, as durable local storage that any instance can rebuild.
 
+> **Shard** is the word these docs use for one unit of ownership: a single
+> `(topic, partition)` pair, backed by one changelog topic. The API spells it
+> `TopicPartition` and calls it a partition — when you are consuming a topic, a
+> shard *is* one of its partitions. When you are not, it is just a name you chose.
+
 ## Tutorial
 
 Start here if you are new. A single guided path, from an empty directory to a

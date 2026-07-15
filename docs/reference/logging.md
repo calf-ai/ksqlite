@@ -73,15 +73,6 @@ formatter can read `record.event`, `record.tp`, and so on.
 | `policy_verify_failed` | `WARNING` | `cleanup.policy` could not be read. Verification was skipped. |
 | `policy_verify_unauthorized` | `WARNING` | `cleanup.policy` could not be read because of an authorization denial. |
 
-## Events worth alerting on
-
-| Event | Why |
-|---|---|
-| `compact_policy_detected` | A compacted changelog silently loses history on rebuild. |
-| `truncation_reset`, `checkpoint_clamped` | Retention removed changelog data the local state depended on. |
-| `stop_step_failed` | Shutdown did not complete cleanly. |
-| `rehydrate_force_stop` | Partitions are serving incomplete data. |
-
 ## See also
 
 - [How to provision changelog topics](../how-to/provision-changelog-topics.md)
