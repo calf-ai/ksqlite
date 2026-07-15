@@ -27,9 +27,7 @@ chose.
 ## Requirements
 
 - Python >= 3.10
-- SQLite >= 3.38 linked into your interpreter (`start()` fails fast with
-  `SQLiteVersionError` otherwise — see
-  [How to run on an older SQLite](docs/how-to/run-on-older-sqlite.md))
+- SQLite >= 3.38 (otherwise, see [How to run on an older SQLite](docs/how-to/run-on-older-sqlite.md))
 - A Kafka-compatible broker
 
 ## Install
